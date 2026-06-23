@@ -1,0 +1,1198 @@
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+import pyspark.sql.functions as psf
+
+import os
+import numpy as np
+
+import pandas as pd
+import re
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
+from itertools import combinations
+
+spark = SparkSession.builder.getOrCreate()
+spark.sql("SET spark.databricks.delta.schema.autoMerge.enabled = false")
+Best_model_sandbox = 'dev.sandbox.sd_pl_model_results_master'
+
+Best_index_price_curve = 'dev.sandbox.sd_pl_volume_model_results'
+spark.sql(f""" select * from {Best_model_sandbox}""").display()
+# 'FOMME H/R WAXSTRIP NORMAL-SHARJAH'
+spark.sql(f""" select avg(total_volume), avg(per_vol_price), avg(price_elasticity) from {Best_model_sandbox} where model_name = 'CUREFORM TOILET BALLS' and region_name = 'DUBAI'""").display()
+sdf = spark.table(f"{Best_model_sandbox}").toPandas().sort_values(['model_name','region_name','week'],ascending = True)
+sdf['pk'] = sdf['model_name'].astype(str) + '-' + sdf['region_name'].astype(str)
+def calculate_beta(sdf):
+
+    result_df = (
+        sdf.groupby(['pk'])[['total_volume', 'per_vol_price', 'price_elasticity']]
+        .mean()
+        .reset_index()
+        .rename(columns={
+            'total_volume': 'avg_total_volume',
+            'per_vol_price': 'avg_per_vol_price',
+            'price_elasticity': 'avg_price_elasticity'
+        })
+    )
+    # result_df['beta'] = (result_df['total_volume']/result_df['per_vol_price'])*result_df['avg_price_elasticity']
+    result_df['beta'] = (result_df['avg_total_volume']/result_df['avg_per_vol_price'])*result_df['avg_price_elasticity']
+    return result_df
+beta_table = calculate_beta(sdf)
+beta_table.display()
+sdf = sdf[['pk', 'per_vol_price', 'price_elasticity',
+               'total_volume', 'total_volume_pred', 'week', 'feature_set_name','region_name','material_group_name']]
+
+    # Merge with beta table
+merged_df = sdf.merge(beta_table, on='pk', how='left')
+merged_df.columns
+sdf.info()
+# def calculate_values(sdf, beta_table):
+#     import pandas as pd
+
+#     index = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85,
+#              0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35,
+#              1.4, 1.45, 1.5, 1.55, 1.6]
+#     # Drop duplicates, sort descending, and take the last 9 weeks
+#     last_9_dates = (
+#         sdf[['week', 'week_start_date']]
+#         .drop_duplicates()
+#         .sort_values('week_start_date', ascending=False)
+#         .head(9)
+#         .sort_values('week_start_date')  # Optional: re-sort ascending
+#     )
+
+
+#     # Select required columns
+#     sdf = sdf[['pk', 'per_vol_price', 'price_elasticity',
+#                'total_volume', 'total_volume_pred', 'week', 'feature_set_name','material_group_name','region_name']]
+
+#     # Merge with beta table
+#     merged_df = sdf.merge(beta_table, on='pk', how='left')
+
+#     if merged_df['beta'].isnull().any():
+#         print("Warning: Some rows have null beta values after merge.")
+
+#     # Calculate price_component and prediction difference
+#     merged_df['price_component'] = merged_df['per_vol_price'] * merged_df['beta']
+#     merged_df['pred_minus_price_component'] = merged_df['total_volume_pred'] - merged_df['price_component']
+
+#     # Generate response columns
+#     for i in index:
+#         merged_df[f"{i}_quantity"] = (i * merged_df['per_vol_price'] * merged_df['beta']) + merged_df['pred_minus_price_component']
+#         merged_df[f"{i}_price"] = i * merged_df['per_vol_price']
+#         merged_df[f"{i}_sales"] = merged_df[f"{i}_quantity"] * merged_df[f"{i}_price"]
+
+#     # Reorder columns: base, then all *_price, then *_quantity, then *_sales
+#     base_cols = ['pk', 'per_vol_price', 'price_elasticity',
+#                  'total_volume', 'total_volume_pred', 'week', 'feature_set_name','region_name',
+#                  'price_component', 'pred_minus_price_component','beta','material_group_name']
+
+#     price_cols = [f"{i}_price" for i in index]
+#     quantity_cols = [f"{i}_quantity" for i in index]
+#     sales_cols = [f"{i}_sales" for i in index]
+#     final_order = base_cols + price_cols + quantity_cols + sales_cols
+#     merged_df = merged_df[final_order]
+#     # print(merged_df.columns)
+#     curve_df = merged_df[ ['pk','material_id','region_name','material_group_name']+['price_elasticity'] + ['beta'] + ['feature_set_name'] + sales_cols]
+#     curve_df = curve_df.groupby(['pk','feature_set_name','material_id','region_name','material_group_name'])[
+#     sales_cols + ['price_elasticity', 'beta']
+# ].mean().reset_index()
+
+#     return merged_df,curve_df
+def calculate_values(sdf, beta_table):
+    import pandas as pd
+
+    index = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85,
+             0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35,
+             1.4, 1.45, 1.5, 1.55, 1.6]
+
+    # ✅ Convert 'week' (e.g., "2024-W01") to a datetime
+    sdf['week_start_date'] = pd.to_datetime(sdf['week'] + '-1', format='%G-W%V-%u')
+
+    # ✅ Get last 9 unique weeks based on week_start_date
+    last_9_dates = (
+        sdf[['week', 'week_start_date']]
+        .drop_duplicates()
+        .sort_values('week_start_date', ascending=False)
+        .head(9)
+        .sort_values('week_start_date')  # Optional: ascending order
+    )
+    last_9_weeks = last_9_dates['week'].tolist()
+
+    # ✅ Filter original sdf for last 9 weeks only
+    sdf = sdf[sdf['week'].isin(last_9_weeks)].copy()
+
+    # Drop helper column if not needed
+    sdf.drop(columns=['week_start_date'], inplace=True)
+
+    # ✅ Continue with original logic
+    sdf = sdf[['pk', 'per_vol_price', 'price_elasticity',
+               'total_volume', 'total_volume_pred', 'week', 'feature_set_name', 'material_group_name', 'region_name']]
+
+    # Merge with beta table
+    merged_df = sdf.merge(
+    beta_table.drop(columns=[col for col in beta_table.columns if col in sdf.columns and col != 'pk']),
+    on='pk',
+    how='left'
+)   
+
+    if merged_df['beta'].isnull().any():
+        print("Warning: Some rows have null beta values after merge.")
+    
+    # Calculate price_component and prediction difference
+    merged_df['price_component'] = merged_df['per_vol_price'] * merged_df['beta']
+    
+    merged_df['pred_minus_price_component'] = merged_df['total_volume_pred'] - merged_df['price_component']
+
+    # Generate response columns
+    for i in index:
+        merged_df[f"{i}_quantity"] = (i * merged_df['per_vol_price'] * merged_df['beta']) + merged_df['pred_minus_price_component']
+        merged_df[f"{i}_price"] = i * merged_df['per_vol_price']
+        merged_df[f"{i}_sales"] = merged_df[f"{i}_quantity"] * merged_df[f"{i}_price"]
+
+    # Reorder columns
+    base_cols = [ 'pk', 'per_vol_price', 'price_elasticity',
+                 'total_volume', 'total_volume_pred', 'week', 'feature_set_name', 'region_name',
+                 'price_component', 'pred_minus_price_component', 'beta', 'material_group_name']
+    
+
+    price_cols = [f"{i}_price" for i in index]
+    quantity_cols = [f"{i}_quantity" for i in index]
+    sales_cols = [f"{i}_sales" for i in index]
+    final_order = base_cols + price_cols + quantity_cols + sales_cols
+    merged_df = merged_df[final_order]
+
+    # Aggregate for curve
+    curve_df = merged_df[['pk', 'region_name', 'material_group_name',
+                          'price_elasticity', 'beta', 'feature_set_name'] + sales_cols]
+    curve_df = curve_df.groupby(
+        ['pk', 'feature_set_name','region_name', 'material_group_name']
+    )[sales_cols + ['price_elasticity', 'beta']].mean().reset_index()
+
+    return merged_df, curve_df
+
+merged_df,curve_df = calculate_values(sdf, beta_table)
+curve_df['pk'].nunique()
+merged_df.display()
+curve_df.display()
+curve_df.info()
+# 'CUREFORM TOILET BALLS-DUBAI'
+
+curve_df1 = curve_df[curve_df['pk']=='CUREFORM TOILET BALLS-DUBAI']
+
+
+# curve_df1 = curve_df[curve_df['pk']=='FOMME H/R WAXSTRIP NORMAL-SHARJAH']
+curve_df1
+# # 'CUREFORM TOILET BALLS-DUBAI'
+
+# curve_df1 = curve_df[curve_df['pk']=='CUREFORM TOILET BALLS-DUBAI']
+
+# index = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85,
+#          0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35,
+#          1.4, 1.45, 1.5, 1.55, 1.6]
+
+# # sales_values = [curve_df1.get(f"{i}_sales", 0) for i in index]
+
+# sales_values = [float(curve_df1[f"{i}_sales"]) for i in index]
+# # s1 = list(sales_values)
+# # max_sales = max(sales_values)
+
+# max_value = __builtins__.max(sales_values)
+
+# # for _, row in curve_df1.iterrows():
+# #     sales_values = [float(row[f"{i}_sales"]) for i in index]
+# #     max_sales = max(sales_values)
+
+# max_value
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import math
+import builtins as b
+
+# Define price index
+index = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85,
+         0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35,
+         1.4, 1.45, 1.5, 1.55, 1.6]
+
+max_index_list = []
+comment_list = []
+original_max_index_list = []
+plot_data = []
+
+# First pass: calculate all the data
+for _, row in curve_df1.iterrows():
+    sales_values = [row.get(f"{i}_sales", 0) for i in index]
+    # sales_values = [float(curve_df[f"{i}_sales"].iloc[0]) for i in index]
+    # max_sales = __builtins__.max(sales_values)
+    max_sales = b.max(sales_values)
+
+    # Find where max sales occur
+    max_indices = [i for i, s in enumerate(sales_values) if s == max_sales]
+    max_prices = [index[i] for i in max_indices]
+    original_max_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+    
+    comment = ""
+    
+    if 1.6 in max_prices:
+        adjusted_index = 1.05
+        comment = "Max at 1.6, capped to 1.05"
+
+    # Case 2: If max price < 0.95, cap to 0.95
+    elif all(p < 0.95 for p in max_prices):
+        adjusted_index = 0.95
+        comment = "Max below 0.95, capped to 0.95"
+
+    # Case 3: If 0.95 ≤ max price < 1.0, keep same
+    elif any(0.95 <= p < 1.0 for p in max_prices):
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max between 0.95–1.0, kept same at {adjusted_index}"
+
+    # Case 4: If 1.0 ≤ max price < 1.06, keep same
+    elif any(1.0 <= p < 1.06 for p in max_prices):
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max between 1.0–1.06, kept same at {adjusted_index}"
+
+    # Case 5: If 1.06 ≤ max price < 1.6, cap to 1.05
+    elif any(1.06 <= p < 1.6 for p in max_prices):
+        adjusted_index = 1.05
+        comment = f"Max above 1.06, capped to 1.05"
+
+    # Default: keep same (no adjustment)
+    else:
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max at {adjusted_index}, no adjustment needed"
+
+
+    max_index_list.append(adjusted_index)
+    comment_list.append(comment)
+    original_max_index_list.append(original_max_index)
+    
+    # Store data for plotting
+    plot_data.append({
+        'pk': row['pk'],
+        'sales_values': sales_values,
+        'adjusted_index': adjusted_index,
+        'original_max_index': original_max_index,
+        'elasticity': b.round(row['price_elasticity'], 2),
+        'beta': b.round(row['beta'], 2),
+        'comment': comment
+    })
+    
+    result_df = pd.DataFrame([
+    {
+        'pk': d['pk'],
+        # 'region_name': d['region_name'],
+        # 'model_name': d['model_name'],
+        'adjusted_index': d['adjusted_index'],
+        'original_max_index': d['original_max_index'],
+        'elasticity': d['elasticity'],
+        'beta': d['beta'],
+        'comment': d['comment']
+    }
+    for d in plot_data
+    ])
+
+PLOTS_PER_FIGURE = 16  
+
+for start_idx in range(0, len(plot_data), PLOTS_PER_FIGURE):
+    end_idx = b.min(start_idx + PLOTS_PER_FIGURE, len(plot_data))
+    current_data = plot_data[start_idx:end_idx]
+    
+    n_plots = len(current_data)
+    n_cols = 1
+    n_rows = math.ceil(n_plots / n_cols)
+    
+    subplot_titles = [f"pk: {data['pk']} | E: {data['elasticity']} | B: {data['beta']}" 
+                      for data in current_data]
+    
+    fig = make_subplots(
+        rows=n_rows, 
+        cols=n_cols,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08
+    )
+    fig.update_annotations(
+    font=dict(size=9),   # smaller font
+    yshift=-8            # move titles closer to plots (negative = downward)
+)
+    
+    # Add traces (same as above)
+    for i, data in enumerate(current_data):
+        row = (i // n_cols) + 1
+        col = (i % n_cols) + 1
+        
+        fig.add_trace(
+            go.Scatter(
+                x=index,
+                y=data['sales_values'],
+                mode='lines+markers',
+                line=dict(color='blue', width=2),
+                marker=dict(size=4),
+                showlegend=False,
+                hovertemplate='Price Index: %{x}<br>Sales: %{y}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+        
+        max_y = b.max(data['sales_values'])
+
+        fig.add_trace(
+            go.Scatter(
+                x=[data['adjusted_index'], data['adjusted_index']],
+                y=[0, max_y],
+                mode='lines',
+                line=dict(color='green', dash='dash', width=2),
+                showlegend=False,
+                hovertemplate=f'Max @ {data["adjusted_index"]}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+
+        orig_x = data['original_max_index']
+        orig_y = data['sales_values'][index.index(orig_x)]  # sales value at original max
+        fig.add_trace(
+            go.Scatter(
+                x=[orig_x],
+                y=[orig_y],
+                mode='markers',
+                marker=dict(color='orange', size=10, symbol='circle'),
+                showlegend=False,
+                hovertemplate=f'Original Max @ {orig_x}<br>Sales: {orig_y:.2f}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+    
+    fig.update_layout(
+        title_text=f"Sales Curves - Products {start_idx+1} to {end_idx}",
+        height=400 * n_rows,
+        width=1000,
+        showlegend=False
+    )
+    
+    fig.show()
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import math
+import builtins as b
+
+# Define price index
+index = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85,
+         0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35,
+         1.4, 1.45, 1.5, 1.55, 1.6]
+
+max_index_list = []
+comment_list = []
+original_max_index_list = []
+plot_data = []
+
+# First pass: calculate all the data
+for _, row in curve_df.iterrows():
+    sales_values = [row.get(f"{i}_sales", 0) for i in index]
+    # sales_values = [float(curve_df[f"{i}_sales"].iloc[0]) for i in index]
+    # max_sales = __builtins__.max(sales_values)
+    max_sales = b.max(sales_values)
+
+    # Find where max sales occur
+    max_indices = [i for i, s in enumerate(sales_values) if s == max_sales]
+    max_prices = [index[i] for i in max_indices]
+    original_max_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+    
+    comment = ""
+    
+    if 1.6 in max_prices:
+        adjusted_index = 1.05
+        comment = "Max at 1.6, capped to 1.05"
+
+    # Case 2: If max price < 0.95, cap to 0.95
+    elif all(p < 0.95 for p in max_prices):
+        adjusted_index = 0.95
+        comment = "Max below 0.95, capped to 0.95"
+
+    # Case 3: If 0.95 ≤ max price < 1.0, keep same
+    elif any(0.95 <= p < 1.0 for p in max_prices):
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max between 0.95–1.0, kept same at {adjusted_index}"
+
+    # Case 4: If 1.0 ≤ max price < 1.06, keep same
+    elif any(1.0 <= p < 1.06 for p in max_prices):
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max between 1.0–1.06, kept same at {adjusted_index}"
+
+    # Case 5: If 1.06 ≤ max price < 1.6, cap to 1.05
+    elif any(1.06 <= p < 1.6 for p in max_prices):
+        adjusted_index = 1.05
+        comment = f"Max above 1.06, capped to 1.05"
+
+    # Default: keep same (no adjustment)
+    else:
+        adjusted_index = max_prices[0] if len(max_prices) == 1 else min(max_prices)
+        comment = f"Max at {adjusted_index}, no adjustment needed"
+
+
+    max_index_list.append(adjusted_index)
+    comment_list.append(comment)
+    original_max_index_list.append(original_max_index)
+    
+    # Store data for plotting
+    plot_data.append({
+        'pk': row['pk'],
+        'sales_values': sales_values,
+        'adjusted_index': adjusted_index,
+        'original_max_index': original_max_index,
+        'elasticity': b.round(row['price_elasticity'], 2),
+        'beta': b.round(row['beta'], 2),
+        'comment': comment
+    })
+    
+    result_df = pd.DataFrame([
+    {
+        'pk': d['pk'],
+        # 'region_name': d['region_name'],
+        # 'model_name': d['model_name'],
+        'adjusted_index': d['adjusted_index'],
+        'original_max_index': d['original_max_index'],
+        'elasticity': d['elasticity'],
+        'beta': d['beta'],
+        'comment': d['comment']
+    }
+    for d in plot_data
+    ])
+
+PLOTS_PER_FIGURE = 16  
+
+for start_idx in range(0, len(plot_data), PLOTS_PER_FIGURE):
+    end_idx = b.min(start_idx + PLOTS_PER_FIGURE, len(plot_data))
+    current_data = plot_data[start_idx:end_idx]
+    
+    n_plots = len(current_data)
+    n_cols = 4
+    n_rows = math.ceil(n_plots / n_cols)
+    
+    subplot_titles = [f"pk: {data['pk']} | E: {data['elasticity']} | B: {data['beta']}" 
+                      for data in current_data]
+    
+    fig = make_subplots(
+        rows=n_rows, 
+        cols=n_cols,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08
+    )
+    fig.update_annotations(
+    font=dict(size=9),   # smaller font
+    yshift=-8            # move titles closer to plots (negative = downward)
+)
+    
+    # Add traces (same as above)
+    for i, data in enumerate(current_data):
+        row = (i // n_cols) + 1
+        col = (i % n_cols) + 1
+        
+        fig.add_trace(
+            go.Scatter(
+                x=index,
+                y=data['sales_values'],
+                mode='lines+markers',
+                line=dict(color='blue', width=2),
+                marker=dict(size=4),
+                showlegend=False,
+                hovertemplate='Price Index: %{x}<br>Sales: %{y}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+        
+        max_y = b.max(data['sales_values'])
+        fig.add_trace(
+            go.Scatter(
+                x=[data['adjusted_index'], data['adjusted_index']],
+                y=[0, max_y],
+                mode='lines',
+                line=dict(color='red', dash='dash', width=2),
+                showlegend=False,
+                hovertemplate=f'Max @ {data["adjusted_index"]}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+    
+    fig.update_layout(
+        title_text=f"Sales Curves - Products {start_idx+1} to {end_idx}",
+        height=300 * n_rows,
+        width=1400,
+        showlegend=False
+    )
+    
+    fig.show()
+result_df.display(Truncate = False)
+type(result_df)
+# Best_index_price_curve  
+
+result_df_spark = spark.createDataFrame(result_df)
+# result_df_spark.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{Best_index_price_curve}")
+display(result_df_spark)
+competitor_csv = '/Workspace/Users/811775@lulumea.com/Pricing Master Notebook - Private label (WIP)/SETA - PL_Pricing_competition(Competitor SKUs) (1).csv'
+competitor_file = 'dev.sandbox.av_seta_competition'
+%sql
+WITH exploded_competitors AS (
+    SELECT 
+        mm.material_id,
+        mm.material_name,
+        competitor_id
+    FROM dev.sandbox.av_seta_competition mm
+    LATERAL VIEW EXPLODE(ARRAY(mm.Comp1_id, mm.Comp2_id, mm.Comp3_id)) t AS competitor_id
+    WHERE competitor_id IS NOT NULL
+)
+
+SELECT  
+    ecc.material_id,
+    ecc.competitor_id,
+    pos.store_id,
+    pos.business_day,
+    ROUND(SUM(pos.amount) / SUM(pos.quantity), 2) AS avg_price
+FROM exploded_competitors ecc
+JOIN gold.transaction.uae_pos_transactions pos 
+    ON ecc.competitor_id = pos.product_id
+join test_txn_info_view tt 
+on tt.material_id = pos.product_id
+and tt.store_id = pos.store_id 
+and tt.business_day = pos.store_id
+GROUP BY 
+    ecc.material_id,
+    ecc.competitor_id,
+    pos.store_id,
+    pos.business_day;
+%sql
+desc dev.sandbox.av_seta_competition
+%sql
+select * from dev.sandbox.av_seta_competition
+import pandas as pd 
+df = pd.read_csv(f'{competitor_csv}')
+spark_df = spark.createDataFrame(df)
+## Write Frame out as Table
+spark_df.write.mode("overwrite").saveAsTable(f"{competitor_file}")
+df.info()
+price_internal_derived = 'dev.sandbox.av_competitor_seta_price1'
+%sql
+select * from dev.sandbox.av_competitor_seta_price1
+spark.sql(f"""
+create or replace table {price_internal_derived}
+with accepted_pair as 
+(
+  select distinct material_id,region_name,ean
+  from analytics.pricing.seta_final_recommendation
+  --where status = 'Accepted'
+),cte as 
+(
+SELECT 
+  concat(comp.material_id,sm.region_name) as pair,
+  comp.material_id,
+  sm.region_name,
+  comp.material_group_name,
+  comp.material_name,
+  comp.category_name,
+  COALESCE(Correct_fit, 'Y') AS correct_fit,
+  ROUND((
+    COALESCE(comp1_price, 0) +
+    COALESCE(comp2_price, 0) +
+    COALESCE(comp3_price, 0)
+  ) / NULLIF(
+    (CASE WHEN comp1_price IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN comp2_price IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN comp3_price IS NOT NULL THEN 1 ELSE 0 END), 0
+  ), 2) AS competition_price,
+  round(sum(amount)/sum(quantity),2) as unit_price_derived,
+  round(ROUND((
+    COALESCE(comp1_price, 0) +
+    COALESCE(comp2_price, 0) +
+    COALESCE(comp3_price, 0)
+  ) / NULLIF(
+    (CASE WHEN comp1_price IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN comp2_price IS NOT NULL THEN 1 ELSE 0 END) +
+    (CASE WHEN comp3_price IS NOT NULL THEN 1 ELSE 0 END), 0
+  ), 2) - round(sum(amount)/sum(quantity),2),2) as difference_price
+FROM {competitor_file} comp
+join gold.transaction.uae_pos_transactions pos
+on pos.product_id = comp.material_id
+join accepted_pair ap 
+on ap.material_id = pos.product_id
+and ap.ean = pos.ean
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-04-20' and '2025-07-13'
+and amount > 0
+GROUP BY ALL
+ORDER BY material_group_name, material_id
+)
+,material_group_level as 
+(
+  select cte.material_group_name,sm.region_name,round(sum(amount)/sum(quantity),2) as mg_price 
+  from cte
+  join gold.material.material_master mm 
+  on cte.material_group_name = mm.material_group_name
+  join gold.transaction.uae_pos_transactions pos 
+  on pos.product_id = cte.material_id
+  join gold.store.store_master sm
+  on sm.store_id = pos.store_id
+  where business_day between '2025-04-20' and '2025-07-13'
+  and brand not ilike '%lulu%' and brand not ilike '%repacked%'
+  group by all
+)
+
+select distinct cte.*,round(unit_price_derived/mg_price,2) as mg_ratio
+from material_group_level mm
+join cte cte
+on cte.material_group_name = mm.material_group_name
+and cte.region_name = mm.region_name
+join accepted_pair ap 
+on ap.material_id = cte.material_id
+and ap.region_name = cte.region_name
+order by 1,2
+""")
+Best_model_sandbox = 'dev.sandbox.sd_pl_pricing_setb_final11'
+gp_data= 'dev.sandbox.sd_profit_marg_pl_setb'
+%sql
+select * from dev.sandbox.sd_profit_marg_pl_setb
+spark.sql(f"""create or replace table {gp_data}
+WITH sales_data AS (
+     SELECT
+         t2.material_id,
+         t3.region_name,
+         t1.store_id,
+         material_group_name,
+         INT(CONCAT(YEAR(t1.business_day), LPAD(MONTH(t1.business_day), 2, '0'))) AS year_month,
+         SUM(t1.amount) AS sales
+     FROM gold.transaction.uae_pos_transactions AS t1
+     JOIN gold.material.material_master AS t2 ON t1.product_id = t2.material_id
+     JOIN gold.store.store_master AS t3 ON t1.store_id = t3.store_id
+     WHERE
+         t1.business_day BETWEEN "2024-07-01" AND "2025-06-30"
+         AND t2.department_class_id in (1,2)
+         AND t3.tayeb_flag = 0
+         AND t1.transaction_type_id NOT IN ("RR", "RT")
+         AND t1.amount > 0
+         AND t1.quantity > 0
+     GROUP BY 1, 2, 3, 4,5
+),
+gp_data_store AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         store_id,
+         year_month,
+         material_id,
+         CAST(gp_wth_chargeback AS DOUBLE) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month BETWEEN 202505 AND 202506
+),
+gp_data_region AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         year_month,
+         material_id,
+         CAST(gp_wth_chargeback AS DOUBLE) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month < 202505
+),
+gp_region_avg AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         material_id,
+         AVG(CAST(gp_wth_chargeback AS DOUBLE)) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month < 202505
+         AND CAST(gp_wth_chargeback AS DOUBLE) >= 0
+     GROUP BY 1, 2
+),
+gp_region_imputed AS (
+     SELECT
+         t1.region_name,
+         t1.year_month,
+         t1.material_id,
+         CASE WHEN t1.gp_wth_chargeback >= 0 THEN t1.gp_wth_chargeback ELSE t2.gp_wth_chargeback END AS gp_wth_chargeback
+     FROM gp_data_region AS t1
+     LEFT JOIN gp_region_avg AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+),
+gp_store_imputed AS (
+     SELECT
+         t1.store_id,
+         t1.year_month,
+         t1.material_id,
+         CASE WHEN t1.gp_wth_chargeback >= 0 THEN t1.gp_wth_chargeback ELSE t2.gp_wth_chargeback END AS gp_wth_chargeback
+     FROM gp_data_store AS t1
+     LEFT JOIN gp_region_avg AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+),
+combined_store AS (
+     SELECT
+         t1.material_id,
+         t1.region_name,
+         t1.store_id,
+         t1.year_month,
+         t1.sales,
+         material_group_name,
+         COALESCE(t1.sales * t2.gp_wth_chargeback / 100, 0) AS profit
+     FROM sales_data AS t1
+     LEFT JOIN gp_store_imputed AS t2
+         ON t1.store_id = t2.store_id
+         AND t1.material_id = t2.material_id
+         AND t1.year_month = t2.year_month
+     WHERE
+         t1.year_month BETWEEN 202505 AND 202506
+),
+combined_region AS (
+     SELECT
+         t1.material_id,
+         t1.region_name,
+         t1.store_id,
+         t1.year_month,
+         t1.sales,
+         material_group_name,
+         COALESCE(t1.sales * t2.gp_wth_chargeback / 100, 0) AS profit
+     FROM sales_data AS t1
+     LEFT JOIN gp_region_imputed AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+         AND t1.year_month = t2.year_month
+     WHERE
+         t1.year_month < 202505
+),
+combined AS (
+     SELECT * FROM combined_store
+     UNION
+     SELECT * FROM combined_region
+)
+,material_group_level AS 
+(
+    select mm.material_group_name, SUM(profit) / SUM(sales) AS margin
+    from combined 
+    join gold.material.material_master mm 
+    on mm.material_group_name = combined.material_group_name
+    GROUP BY mm.material_group_name
+)
+,accepted_pair as 
+(
+  select distinct concat(material_id,region_name) as pair,material_id,region_name,material_group_name
+  from {Best_model_sandbox}
+--   where status = 'Accepted'
+)
+,before_imputed AS 
+(
+SELECT concat(ap.material_id,ap.region_name) as pair,
+       ap.material_group_name,
+       ap.material_id,
+       ap.region_name,
+       SUM(profit) / SUM(sales) AS margin
+
+FROM accepted_pair ap 
+left join combined on ap.material_id = combined.material_id 
+and ap.region_name =combined.region_name
+GROUP BY 1, 2,3,4
+)
+,region_avg_margin AS (
+    SELECT
+        material_id,
+        AVG(margin) AS avg_margin
+    FROM before_imputed
+    WHERE margin IS NOT NULL
+    GROUP BY material_id
+),
+final_margin AS (
+    SELECT
+        b.pair,
+        b.material_id,
+        b.region_name,
+        material_group_name,
+        COALESCE(b.margin, r.avg_margin) AS final_margin
+    FROM before_imputed b
+    LEFT JOIN region_avg_margin r
+        ON b.material_id = r.material_id
+)
+,mg_imputed AS 
+(
+    SELECT
+        material_group_name,
+        AVG(margin) AS avg_margin
+    FROM material_group_level
+    WHERE margin IS NOT NULL
+    GROUP BY material_group_name  
+)
+
+-- select * from mg_imputed
+select fm.pair,
+        fm.material_id,
+        fm.region_name,
+        fm.material_group_name,
+        COALESCE(fm.final_margin, mg.avg_margin) AS final_margin
+from final_margin fm 
+left join mg_imputed mg 
+on mg.material_group_name = fm.material_group_name
+""")
+%sql
+select * 
+from dev.sandbox.sd_pl_sku_region_contr_seta
+%sql
+create or replace table dev.sandbox.av_sales
+with cte as 
+(
+    select distinct pair,unit_price_derived as price,week,row_number() over (partition by pair order by week desc) as rk
+    from dev.sandbox.sd_pl_pricing_seta_final
+    where status = 'Accepted'
+)
+
+select distinct pair,round(avg(price),2) as price
+from cte
+where rk <= 12
+group by all
+%sql
+desc dev.sandbox.sd_pl_pricing_seta_final
+%sql
+select * from dev.sandbox.sd_latest_price_skus
+%sql
+select * from gold.marketing.price_changes
+where material_id = '407107' and ean = '6294011621895'
+%sql
+with cte as 
+(
+    select distinct pair,material_id,region_name
+    from dev.sandbox.sd_pl_pricing_seta_final
+    where status = 'Accepted'
+)
+,cte1 as 
+(
+select pair,material_id,region_name
+from dev.sandbox.av_pricing_final_skus fs
+join cte on cte.material_id = fs.material_id
+)
+
+select pair,product_id,pos.ean,cte1.region_name,sum(amount)/sum(quantity) as price
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id 
+join cte1 on cte1.ean = pos.ean
+where transaction_date >= '2025-04-27' and transaction_date <= '2025-07-20'
+group by all
+%sql
+select * 
+from dev.sandbox.av_pricing_final_skus fs
+where material_id = '1663003'
+%sql
+create or replace table dev.sandbox.av_pricing_
+with pair as 
+(
+    select distinct pair,fs.material_group_name,fs.material_id,fs.region_name,pf.ean
+    from dev.sandbox.sd_pl_pricing_seta_final fs
+    join dev.sandbox.av_pricing_final_skus pf 
+    on pf.material_id = fs.material_id
+    where status = 'Accepted'
+)
+
+select * 
+from pair
+%sql
+select distinct product_id ,pos.ean,mm.material_name
+from gold.transaction.uae_pos_transactions pos 
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between '2025-01-01' and '2025-02-01'
+and ean = '6291106890891'
+%sql
+select * from dev.sandbox.sd_price_changes_pl_ean
+where ean = '6291106890891
+'
+q = """select transaction_id,material_id,ean,sum(amount)
+from gold.transaction.uae_pos_transactions pos 
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id 
+where business_day >= '2025-07-01' and business_day <= '2025-07-22'
+and department_name = 'MEAT
+and store_id = 2600
+group by 1,2,3
+having count(distinct ean) > 1
+ """
+%sql
+with cte as 
+(
+    select transaction_id,product_id,ean,sum(amount) as sale
+    FROM 
+        gold.transaction.uae_pos_transactions pos
+    JOIN 
+        gold.material.material_master mm 
+        ON mm.material_id = pos.product_id 
+    WHERE 
+        business_day BETWEEN '2025-07-01' AND '2025-07-22'
+        AND department_name = 'MEAT'
+        AND store_id = 2600
+        AND pos.ecom_aggregator_amount <= 0
+        group by all
+)
+
+select transaction_id,product_id,count(distinct ean)
+from cte 
+group by all
+order by 3 desc
+%sql
+WITH cte AS (
+    SELECT 
+        transaction_id,
+        product_id,
+        SUM(amount) AS total_amount,
+        COUNT(*) AS cnt
+    FROM 
+        gold.transaction.uae_pos_transactions pos
+    JOIN 
+        gold.material.material_master mm 
+        ON mm.material_id = pos.product_id 
+    WHERE 
+        business_day BETWEEN '2025-07-01' AND '2025-07-22'
+        AND department_name = 'MEAT'
+        AND store_id = 2600
+        AND pos.ecom_aggregator_amount <= 0
+    GROUP BY 
+        transaction_id, product_id
+    HAVING 
+        COUNT(*) > 1
+)
+
+SELECT 
+    SUM(total_amount) AS duplicated_transaction_total_amount
+FROM 
+    cte;
+
+%sql
+
+WITH sales_data AS (
+     SELECT
+         t2.material_id,
+         t3.region_name,
+         t1.store_id,
+         material_group_name,
+         INT(CONCAT(YEAR(t1.business_day), LPAD(MONTH(t1.business_day), 2, '0'))) AS year_month,
+         SUM(t1.amount) AS sales
+     FROM gold.transaction.uae_pos_transactions AS t1
+     JOIN gold.material.material_master AS t2 ON t1.product_id = t2.material_id
+     JOIN gold.store.store_master AS t3 ON t1.store_id = t3.store_id
+     WHERE
+         t1.business_day BETWEEN "2024-07-01" AND "2025-06-30"
+         and (brand ilike '%lulu%')
+         AND t2.department_class_id in (1,2)
+         and bulk_sale_flag is null
+         AND t3.tayeb_flag = 0
+         AND t1.transaction_type_id NOT IN ("RR", "RT")
+         AND t1.amount > 0
+         AND t1.quantity > 0
+     GROUP BY 1, 2, 3, 4,5
+),
+gp_data_store AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         store_id,
+         year_month,
+         material_id,
+         CAST(gp_wth_chargeback AS DOUBLE) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month BETWEEN 202505 AND 202506
+),
+gp_data_region AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         year_month,
+         material_id,
+         CAST(gp_wth_chargeback AS DOUBLE) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month < 202505
+),
+gp_region_avg AS (
+     SELECT
+         CASE WHEN region = "AUH" THEN "ABU DHABI"
+             WHEN region = "ALN" THEN "AL AIN"
+             WHEN region = "DXB" THEN "DUBAI"
+             ELSE "SHARJAH" END AS region_name,
+         material_id,
+         AVG(CAST(gp_wth_chargeback AS DOUBLE)) AS gp_wth_chargeback
+FROM gold.business.gross_profit
+     WHERE
+         country = 'AE'
+         AND year_month < 202505
+         AND CAST(gp_wth_chargeback AS DOUBLE) >= 0
+     GROUP BY 1, 2
+),
+gp_region_imputed AS (
+     SELECT
+         t1.region_name,
+         t1.year_month,
+         t1.material_id,
+         CASE WHEN t1.gp_wth_chargeback >= 0 THEN t1.gp_wth_chargeback ELSE t2.gp_wth_chargeback END AS gp_wth_chargeback
+     FROM gp_data_region AS t1
+     LEFT JOIN gp_region_avg AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+),
+gp_store_imputed AS (
+     SELECT
+         t1.store_id,
+         t1.year_month,
+         t1.material_id,
+         CASE WHEN t1.gp_wth_chargeback >= 0 THEN t1.gp_wth_chargeback ELSE t2.gp_wth_chargeback END AS gp_wth_chargeback
+     FROM gp_data_store AS t1
+     LEFT JOIN gp_region_avg AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+),
+combined_store AS (
+     SELECT
+         t1.material_id,
+         t1.region_name,
+         t1.store_id,
+         t1.year_month,
+         t1.sales,
+         material_group_name,
+         COALESCE(t1.sales * t2.gp_wth_chargeback / 100, 0) AS profit
+     FROM sales_data AS t1
+     LEFT JOIN gp_store_imputed AS t2
+         ON t1.store_id = t2.store_id
+         AND t1.material_id = t2.material_id
+         AND t1.year_month = t2.year_month
+     WHERE
+         t1.year_month BETWEEN 202505 AND 202506
+),
+combined_region AS (
+     SELECT
+         t1.material_id,
+         t1.region_name,
+         t1.store_id,
+         t1.year_month,
+         t1.sales,
+         material_group_name,
+         COALESCE(t1.sales * t2.gp_wth_chargeback / 100, 0) AS profit
+     FROM sales_data AS t1
+     LEFT JOIN gp_region_imputed AS t2
+         ON t1.region_name = t2.region_name
+         AND t1.material_id = t2.material_id
+         AND t1.year_month = t2.year_month
+     WHERE
+         t1.year_month < 202505
+),
+combined AS (
+     SELECT * FROM combined_store
+     UNION
+     SELECT * FROM combined_region
+)
+
+
+select sum(profit) from combined
+243000/76491128
+480000/76491128
+76491128/297408394.5038892
+%sql
+create or replace table dev.sandbox.av_recommendations as 
+select * from analytics.pricing.seta_final_recommendation
+%sql
+select sum(amount)
+from gold.transaction.uae_pos_transactions pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between current_date - 365 and current_date
+and brand ilike '%lulu%'
+and department_id between 1 and 13
+-- and category_name in ('COOKING OILS & GHEE', 'FRESH POULTRY', 'DAIRY', 'EGGS', 'FOILS & BAGS', 'PAPER GOODS', 'LAUNDRY DETERGENTS', 'HOUSEHOLD CLEANING', 'FROZEN POULTRY', 'RICE', 'FROZEN VEGETABLES', 'PASTA & NOODLE', 'COOKED MEAT', 'DISPOSABLE HOUSE WARE', 'SAUCES & PICKLES', 'LONG LIFE DAIRY PRODUCTS', 'CANNED VEGETABLES', 'FROZEN READY MEALS', 'SNACKS', 'CRISPS, SNACKS & DRIED FRUITS', 'BOUGHT IN PREPACKED DELI', 'PERSONAL CARE (GENERAL)', 'BOUGHT IN BREAD & CAKES', 'CONDIMENTS', 'CHILLED READY TO COOK', 'FROZEN MEAT', 'PRESERVATIVES & SPREADS', 'BREAKFAST CEREALS', 'BISCUITS & CAKES'
+-- )
+%sql
+select sum(amount)
+from gold.transaction.uae_pos_transactions pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between current_date - 365 and current_date
+and brand ilike '%lulu%'
+and department_id between 1 and 13
+and category_name in ('COOKING OILS & GHEE', 'FRESH POULTRY', 'DAIRY', 'EGGS', 'FOILS & BAGS', 'PAPER GOODS', 'LAUNDRY DETERGENTS', 'HOUSEHOLD CLEANING', 'FROZEN POULTRY', 'RICE', 'FROZEN VEGETABLES', 'PASTA & NOODLE', 'COOKED MEAT', 'DISPOSABLE HOUSE WARE', 'SAUCES & PICKLES', 'LONG LIFE DAIRY PRODUCTS', 'CANNED VEGETABLES', 'FROZEN READY MEALS', 'SNACKS', 'CRISPS, SNACKS & DRIED FRUITS', 'BOUGHT IN PREPACKED DELI', 'PERSONAL CARE (GENERAL)', 'BOUGHT IN BREAD & CAKES', 'CONDIMENTS', 'CHILLED READY TO COOK', 'FROZEN MEAT', 'PRESERVATIVES & SPREADS', 'BREAKFAST CEREALS', 'BISCUITS & CAKES'
+)
+%sql
+select sum(amount)
+from gold.transaction.uae_pos_transactions pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between current_date - 365 and current_date
+and department_id between 1 and 13
+and brand ilike '%lulu%'
+and category_name in ('COOKING OILS & GHEE',  'RICE',  'SAUCES & PICKLES', 'LONG LIFE DAIRY PRODUCTS',    'CRISPS, SNACKS & DRIED FRUITS', 'BOUGHT IN PREPACKED DELI', 'PERSONAL CARE (GENERAL)', 'BOUGHT IN BREAD & CAKES','PRESERVATIVES & SPREADS', 'BREAKFAST CEREALS', 'BISCUITS & CAKES','PAPER GOODS', 
+)
+%sql
+select sum(amount)
+from gold.transaction.uae_pos_transactions pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between current_date - 365 and current_date
+and department_id between 1 and 13
+and brand ilike '%lulu%'
+and category_name in ('COOKING OILS & GHEE',  'RICE',  'SAUCES & PICKLES', 'LONG LIFE DAIRY PRODUCTS',    'CRISPS, SNACKS & DRIED FRUITS', 'BOUGHT IN PREPACKED DELI',  'PRESERVATIVES & SPREADS',  'BISCUITS & CAKES','PAPER GOODS')
+%md
+# ROUGH 
+%sql
+select 
+  *
+from gold.transaction.uae_pos_transactions
+where business_day = '2025-10-09'
+%sql
+select 
+  ROUND(sum(amount),1) as sales,
+  count(distinct transaction_id) as num_trans,
+  ROUND(sum(amount)/sum(quantity),2) as avg_price_derived,
+  avg(unit_price) as avg_unit_price,
+  avg(regular_unit_price) as avg_regular_unit_price,
+  avg(actual_unit_price) as avg_actual_unit_price,
+  ROUND(sum(amount)/count(distinct transaction_id),2) as avg_apent_per_trip
+from gold.transaction.uae_pos_transactions as pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where 
+  amount > 0
+  AND quantity > 0
+  AND bulk_sale_flag is null
+  AND transaction_type in ('SALE','SELL_MEDIA')
+  AND business_day between '2025-01-01' and '2025-10-31'
+  -- AND mm.department_id between 1 and 13
+%sql
+select 
+  ROUND(sum(amount),1) as sales,
+  count(distinct transaction_id) as num_trans,
+  ROUND(sum(amount)/sum(quantity),2) as avg_price,
+  ROUND(sum(amount)/count(distinct transaction_id),2) as avg_apent_per_trip
+from gold.transaction.uae_pos_transactions as pos
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where 
+  amount > 0
+  AND quantity > 0
+  AND bulk_sale_flag is null
+  AND transaction_type in ('SALE','SELL_MEDIA')
+  AND business_day between '2024-01-01' and '2024-10-31'
+  -- AND mm.department_id between 1 and 13

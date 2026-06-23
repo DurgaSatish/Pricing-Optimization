@@ -1,0 +1,1480 @@
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+import pyspark.sql.functions as psf
+
+import os
+import numpy as np
+
+import pandas as pd
+import re
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
+from itertools import combinations
+
+spark = SparkSession.builder.getOrCreate()
+spark.sql("SET spark.databricks.delta.schema.autoMerge.enabled = false")
+# Get distinct category names
+category_rows = spark.sql("""
+    SELECT DISTINCT category_name 
+    FROM gold.material.material_master 
+    WHERE department_id BETWEEN 1 AND 13
+    ORDER BY category_name
+""").collect()
+
+# Use dot notation
+category_names = [row.category_name for row in category_rows]
+
+# Use the first two as defaults
+default_categories = category_names[:2]
+default_value_str = ",".join(default_categories)
+# print(category_names)
+
+dbutils.widgets.multiselect(
+    name="Category names",
+    defaultValue = "CONFECTIONERY",
+    choices=category_names
+)
+
+# Get selected categories
+selected_categories = dbutils.widgets.get("Category names").split(',')
+print(f"Selected: {selected_categories}")
+print(f"Selected: {selected_categories}")
+set = 'pl_setc'
+# mg = 'tea_bags'
+# mg = 'disinfectants'
+calendar_week = 'dev.sandbox.sd_pl_pricing_calendar_week'
+
+skus_list = f'dev.sandbox.sd_{set}_scoping_sku_list'
+# contr_last_1yr_cat = f'dev.sandbox.sd_pl_pricing_cat_contr_{set}'
+# summary_table_category = f'dev.sandbox.sd_pricing_summary_cat_{set}' # Returns the table with summary of the category both inscope and outscope
+# summary_table_mg = f'dev.sandbox.sd_pricing_summary_mg_{set}' # Returns the table with summary of the material_group both inscope and outscope
+# inscope_table_category = f'dev.sandbox.sd_final_inscope_cat_{set}' # Returns the table with eligible sku to model
+
+inscope_table_mg = f'dev.sandbox.sd_{set}_scoping_sku_mg_flag' # Returns the table with eligible sku to model
+volume_map_inscope = f'dev.sandbox.sd_{set}_scoping_att_vol_map'
+volume_classification = f'dev.sandbox.sd_{set}_scoping_volume_class'
+weekly_model_wtd_price = f'dev.sandbox.sd_{set}_scoping_wtd_price_volume'
+dist_price_points = f'dev.sandbox.sd_{set}_scoping_vol_price_change'
+final_table_consecutive_weeks = f'dev.sandbox.sd_{set}_scoping_vol_final'
+final_table_ean_list = f'dev.sandbox.sd_{set}_scoping_vol_final_ean'
+
+
+# final_table_ean_list_mg = f'dev.sandbox.sd_{set}_{mg}_scoping_vol_final_ean'
+final_models_list = f'dev.sandbox.sd_{set}_scoping_flag_models'
+master_scope_tb = f'dev.sandbox.sd_pl_scoping_master_vol_ean'
+import pandas as pd
+import builtins
+
+# Function to generate dates for a given year, excluding Feb 28 and Feb 29
+def generate_dates(year):
+    dates = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31", freq='D')
+    return dates[~((dates.month == 2) & (dates.day.isin([28, 29])))]
+
+# Generate date series for all years
+dates_2022 = pd.Series(generate_dates(2022))
+dates_2023 = pd.Series(generate_dates(2023))
+dates_2024 = pd.Series(generate_dates(2024))
+dates_2025 = pd.Series(generate_dates(2025))
+
+# Determine the maximum length
+max_len = builtins.max(len(dates_2022), len(dates_2023), len(dates_2024), len(dates_2025))
+
+# Reindex to make all series the same length
+dates_2022 = dates_2022.reindex(range(max_len))
+dates_2023 = dates_2023.reindex(range(max_len))
+dates_2024 = dates_2024.reindex(range(max_len))
+dates_2025 = dates_2025.reindex(range(max_len))
+
+# Create the wide-format calendar
+calendar_df = pd.DataFrame({
+    "2022": dates_2022,
+    "2023": dates_2023,
+    "2024": dates_2024,
+    "2025": dates_2025
+})
+
+calendar_df["week_number"] = (calendar_df.index // 7) + 1
+
+# Melt to long format
+melted_df = pd.melt(calendar_df, id_vars="week_number",
+                    value_vars=["2022", "2023", "2024", "2025"],
+                    var_name="year", value_name="date")
+
+# Drop rows with missing dates
+melted_df = melted_df.dropna(subset=["date"])
+
+# Add week label and format date
+melted_df["week_label"] = melted_df.apply(
+    lambda row: f"{row['year']}-W{int(row['week_number']):02}", axis=1)
+
+melted_df["date"] = melted_df["date"].dt.strftime('%Y-%m-%d')
+
+# Compute week_start_date per (year, week_number)
+week_start = (
+    melted_df.groupby(["year", "week_number"])["date"]
+    .min()
+    .reset_index()
+    .rename(columns={"date": "week_start_date"})
+)
+
+# Merge back
+final_df = (
+    melted_df.merge(week_start, on=["year", "week_number"], how="left")
+    [["date", "week_label", "week_start_date"]]
+    .sort_values(["week_label", "date"])
+    .reset_index(drop=True)
+)
+
+final_df
+
+spark_cal_df = spark.createDataFrame(final_df)
+spark_cal_df.write.mode('overwrite').option("overwriteSchema", "true").saveAsTable(calendar_week)
+
+# Final output
+# final_df = melted_df[["date", "week_label"]].sort_values(["week_label", "date"]).reset_index(drop=True)
+calendar_weeks_till_date = f"""
+
+with max_weeks as (
+select 
+    week_label
+from {calendar_week} 
+where date >= CURRENT_DATE() -  740
+    AND date <= CURRENT_DATE() - 1
+group by week_label
+having count(date) = 7
+)
+
+select 
+    *
+    --count(distinct week_label) as week_counts
+from {calendar_week} 
+where week_label in (select week_label from max_weeks)
+order by date desc
+"""
+
+sp_df = spark.sql(calendar_weeks_till_date)
+sp_df.createOrReplaceTempView("calendar")
+sp_df.display()
+formatted = ",".join(f"'{x}'" for x in selected_categories)
+
+# Step 5: Register as temporary view or config
+spark.sql(f"CREATE OR REPLACE TEMP VIEW selected_categories AS SELECT explode(array({formatted})) AS category_name")
+
+spark.sql(f"""
+
+WITH latest_12_weeks AS (
+    SELECT DISTINCT week_label
+    FROM calendar
+    ORDER BY week_label DESC
+    LIMIT 12
+),
+latest_52_weeks AS (
+    SELECT DISTINCT week_label
+    FROM calendar
+    ORDER BY week_label DESC
+    LIMIT 52
+),
+limited_12_range AS (
+    SELECT MIN(date) AS min_date_last_12, MAX(date) AS max_date_last_12
+    FROM calendar
+    WHERE week_label IN (SELECT week_label FROM latest_12_weeks)
+),
+limited_52_range AS (
+    SELECT MIN(date) AS min_date_last_52, MAX(date) AS max_date_last_52
+    FROM calendar
+    WHERE week_label IN (SELECT week_label FROM latest_52_weeks)
+),
+full_range AS (
+    SELECT MIN(date) AS min_full, MAX(date) AS max_full
+    FROM calendar
+)
+
+-- Final combined select
+SELECT 
+    f.min_full,
+    f.max_full,
+    l12.min_date_last_12,
+    l12.max_date_last_12,
+    l52.min_date_last_52,
+    l52.max_date_last_52
+FROM full_range f
+CROSS JOIN limited_12_range l12
+CROSS JOIN limited_52_range l52;
+
+""").display()
+
+%sql
+
+with all_category_pl_data AS (
+select 
+  count(distinct pos.product_id) as dist_sku,
+  sum(amount) as sales
+FROM gold.material.material_master mm
+JOIN gold.transaction.uae_pos_transactions pos 
+  ON mm.material_id = pos.product_id
+-- join selected_categories sc 
+--   on sc.category_name = mm.category_name
+join gold.store.store_master sm 
+  on sm.store_id = pos.store_id
+WHERE 1 = 1
+  AND business_day BETWEEN '2024-09-25' AND '2025-09-24'
+  AND (brand ILIKE '%lulu%')
+  AND business_day <> '2025-02-28'
+  AND bulk_sale_flag is null
+  AND amount > 0
+  AND quantity > 0
+  AND transaction_type in ('SALE','SELL_MEDIA')
+  AND mm.department_id between 1 and 13
+),
+
+selected_category_pl_data AS (
+select 
+pos.product_id,
+CASE
+    WHEN mm.material_hierarchy_name ilike '%pre%'
+      or mm.material_hierarchy_name ilike '%offer%'
+      or mm.material_hierarchy_name ilike '%value%'
+      or mm.material_hierarchy_name ilike '%combo%'
+      or mm.material_hierarchy_name ilike '%get%'
+      OR LOWER(mm.material_name) LIKE '%+%'
+      OR LOWER(mm.material_name) RLIKE '[0-9]+x[0-9]+'
+      OR LOWER(mm.material_name) LIKE '% po'
+      OR LOWER(mm.material_name) LIKE '%offer%'
+      OR LOWER(mm.material_name) LIKE '%ofr%'
+      OR LOWER(mm.material_name) LIKE '%offr%'
+      OR LOWER(mm.material_name) LIKE '%p/o%'
+    THEN 'Promo'
+    ELSE 'Non-Promo' 
+  END AS flag,
+  amount
+-- round(sum(amount),1) as sales
+FROM gold.material.material_master mm
+JOIN gold.transaction.uae_pos_transactions pos 
+  ON mm.material_id = pos.product_id
+-- join selected_categories sc 
+--   on sc.category_name = mm.category_name
+join gold.store.store_master sm 
+  on sm.store_id = pos.store_id
+WHERE 1 = 1
+  AND business_day BETWEEN '2024-09-25' AND '2025-09-24'
+  
+  -- this is done for private labels as pricing is mainly for PL  
+  AND (brand ILIKE '%lulu%')
+  
+  AND business_day <> '2025-02-28'
+  AND bulk_sale_flag is null
+  AND amount > 0
+  AND quantity > 0
+  AND transaction_type in ('SALE','SELL_MEDIA')
+  AND mm.department_id between 1 and 13
+  AND mm.category_name in ('FOILS & BAGS', 'LAUNDRY DETERGENTS', 'HOUSEHOLD CLEANING', 'PASTA & NOODLE', 'DISPOSABLE HOUSE WARE', 'PERSONAL CARE (GENERAL)', 'BOUGHT IN BREAD & CAKES', 'CONDIMENTS', 'CHILLED READY TO COOK', 'BREAKFAST CEREALS', 'HOME BAKING', 'BEVERAGES - HOT')
+)
+
+
+
+select
+  'Overall PL' as category,
+  count(distinct product_id) as dist_sku,
+  round(sum(amount),1) as sales
+from selected_category_pl_data
+UNION
+select
+  'Overall PL - Promo' as category,
+  count(distinct product_id) as dist_sku,
+  round(sum(amount),1) as sales
+from selected_category_pl_data
+where flag = 'Promo'
+UNION
+select
+  'Overall PL - Non Promo' as category,
+  count(distinct product_id) as dist_sku,
+  round(sum(amount),1) as sales
+from selected_category_pl_data
+where flag = 'Non-Promo'
+
+
+spark.sql(f"""
+
+create or replace table {skus_list} AS 
+WITH filtered_materials AS (
+  SELECT DISTINCT 
+    pos.product_id as material_id,
+    mm.material_name,
+    mm.material_group_name,
+    mm.category_name,
+    sm.region_name,
+    mm.material_hierarchy_name,
+    CASE
+      WHEN mm.material_hierarchy_name ilike '%pre%'
+        or mm.material_hierarchy_name ilike '%offer%'
+        or mm.material_hierarchy_name ilike '%value%'
+        or mm.material_hierarchy_name ilike '%combo%'
+        or mm.material_hierarchy_name ilike '%get%'
+        OR LOWER(mm.material_name) LIKE '%+%'
+        OR LOWER(mm.material_name) RLIKE '[0-9]+x[0-9]+'
+        OR LOWER(mm.material_name) LIKE '% po'
+        OR LOWER(mm.material_name) LIKE '%offer%'
+        OR LOWER(mm.material_name) LIKE '%ofr%'
+        OR LOWER(mm.material_name) LIKE '%offr%'
+        OR LOWER(mm.material_name) LIKE '%p/o%'
+      THEN 'Promo'
+      ELSE 'Non-Promo' 
+    END AS flag
+  FROM gold.material.material_master mm
+  JOIN gold.transaction.uae_pos_transactions pos 
+    ON mm.material_id = pos.product_id
+  join selected_categories sc 
+  on sc.category_name = mm.category_name
+  join gold.store.store_master sm 
+  on sm.store_id = pos.store_id
+  WHERE 1 = 1
+    AND business_day BETWEEN CURRENT_DATE - 90 AND CURRENT_DATE
+    AND (brand ILIKE '%lulu%') --OR brand ILIKE '%repacked%')
+  GROUP BY 
+    pos.product_id,
+    mm.material_name,
+    mm.material_group_name,
+    mm.category_name,
+    sm.region_name,
+    mm.material_hierarchy_name
+),
+
+-- Aggregate transactional data by week
+weekly_transactions AS (
+  SELECT 
+    pos.product_id as material_id,
+    pos.ean,
+    f.flag,
+    f.material_name,
+    f.material_group_name,
+    f.category_name,
+    sm.region_name,
+    SUM(pos.amount) AS sales,
+    SUM(pos.quantity) AS quantity,
+    ROUND(SUM(pos.amount) / NULLIF(SUM(pos.quantity), 0), 2) AS unit_price_derived
+  FROM gold.transaction.uae_pos_transactions pos 
+  JOIN gold.store.store_master sm
+    on sm.store_id = pos.store_id
+  JOIN filtered_materials f
+    ON f.material_id = pos.product_id
+      and f.region_name = sm.region_name
+  WHERE 1 = 1
+  and pos.amount > 0
+    AND pos.quantity > 0
+    AND pos.bulk_sale_flag IS NULL
+    AND business_day BETWEEN '2024-09-25' AND '2025-09-24'
+ -- AND (brand ILIKE '%lulu%')
+  AND business_day <> '2025-02-28'
+  GROUP BY 
+    pos.product_id,
+    pos.ean,
+    f.flag,
+    f.material_name,
+    f.material_group_name,
+    f.category_name,
+    sm.region_name
+)
+
+SELECT 
+*
+FROM weekly_transactions t
+
+""" 
+)
+
+
+spark.sql(f"""select * from {skus_list}""").display()
+spark.sql(f"""
+create or replace table {inscope_table_mg} AS
+WITH base_table AS (
+  SELECT 
+    material_id,
+    ean,
+    region_name,
+    material_name,
+    material_group_name,
+    category_name,
+    sales,
+    quantity,
+    unit_price_derived,
+    -- sales_last_1yr,
+    -- sales_last_12w,
+    flag
+    -- price_quantity_corr,
+    -- history_weeks,
+    -- weeks_5pct_dev,
+    -- distinct_price_points,
+    -- max_consecutive_weeks
+    FROM {skus_list}
+),
+
+total_sales AS (
+  SELECT 
+    material_group_name,
+    region_name,
+    round(SUM(sales),1) AS mg_sales
+    -- round(SUM(sales_last_12w),1) AS mg_sales_12w
+  FROM base_table
+  GROUP BY material_group_name, region_name
+),
+
+mg_cummulative_sales AS (
+  SELECT 
+    b.*,
+    t.mg_sales,
+    -- t.mg_sales_12w,
+    round(SUM(sales) OVER (PARTITION BY b.material_group_name, b.region_name ORDER BY sales DESC),1) AS cum_sales
+    -- round(SUM(sales_last_12w) OVER (PARTITION BY b.material_group_name, b.region_name ORDER BY sales_last_12w DESC),1) AS cum_sales_12w
+  FROM base_table b
+  JOIN total_sales t 
+    ON b.material_group_name = t.material_group_name
+    AND b.region_name = t.region_name
+),
+
+final_flagged AS (
+  SELECT *,
+  CASE WHEN cum_sales > 0.90 * mg_sales AND sales < 6000 THEN 1 ELSE 0 
+    END AS lack_of_contribution
+--   CASE WHEN cum_sales_12w > 0.90 * mg_sales_12w AND (sales_last_12w < 1500 OR sales_last_12w IS NULL) THEN 1 ELSE 0 
+--   END AS lack_of_recent_contribution
+FROM mg_cummulative_sales
+)
+
+SELECT 
+  region_name,
+  material_id,
+  ean,
+  material_name,
+  material_group_name,
+  category_name,
+  sales,
+  quantity,
+  unit_price_derived,
+  flag as promo_flag,
+  lack_of_contribution
+--   ROUND(100.0 * sales_last_1yr / NULLIF(mg_sales_last_1yr, 0), 2) AS sales_last_1yr_contr_pct,
+--   sales_last_12w,
+--   ROUND(100.0 * sales_last_12w / NULLIF(mg_sales_12w, 0), 2) AS sales_12w_contr_pct,
+--   price_quantity_corr
+FROM final_flagged ff
+-- WHERE 
+--   flag = 'Non-Promo'
+  -- AND lack_of_contribution = 0
+""")
+
+spark.sql(f"select * from {inscope_table_mg}").display()
+spark.sql(f"""
+select 
+  count(distinct material_id) as dist_sku,
+  sum(sales)
+from {inscope_table_mg}
+WHERE 
+  promo_flag = 'Non-Promo'
+  AND lack_of_contribution = 0
+""").display()
+
+# you can use analytics.promo.material_attributes this table instead of pj_attribute table 
+
+spark.sql(f"""
+create or replace table {volume_map_inscope} AS
+
+with mapping_base AS
+(
+  select 
+    mds.material_id,
+    mds.ean,
+    mds.material_name,
+    mds.material_group_name,
+    mds.category_name,
+    mds.region_name,
+    ROUND(mds.sales,1) as sales,
+    mds.quantity,
+    mds.unit_price_derived,
+    mds.promo_flag,
+    mds.lack_of_contribution,
+    att.volume,
+    att.units,
+    att.item_count,
+    -- -- att.volume * att.item_count as total_volume,
+    -- CASE 
+    --     WHEN units = 'KG' THEN volume * 1000 * item_count
+    --     WHEN units = 'G'  THEN volume * item_count
+    --     WHEN units = 'L'  THEN volume * 1000 * item_count
+    --     WHEN units = 'ML' THEN volume * item_count
+    --     ELSE volume * item_count
+    -- END AS total_volume_gen,
+    case when att.volume is null OR att.units is null then 'no_map'
+       else 'attribute_extraction' end as volume_source
+  -- from dev.sandbox.sd_mds_weekly_pl_setc as mds
+  from {inscope_table_mg} as mds
+  left join 
+  (
+    select 
+      material_id,
+      material_name,
+      attr_1 as volume,
+      attr_2 as units,
+      attr_3 as item_count
+    from dev.sandbox.pj_attributes_master
+    -- qualify row_number() over(partition by material_id order by item_count desc) = 1
+  ) as att
+    ON mds.material_id = att.material_id
+  group by 
+    mds.material_id,
+    mds.ean,
+    mds.material_name,
+    mds.material_group_name,
+    mds.category_name,
+    mds.region_name,
+    mds.sales,
+    mds.quantity,
+    mds.unit_price_derived,
+    mds.promo_flag,
+    mds.lack_of_contribution,
+    att.volume,
+    att.units,
+    att.item_count
+),
+
+material_att_map AS 
+(
+select 
+  mb.material_id,
+  mb.ean,
+  mb.material_name,
+  mb.material_group_name,
+  mb.category_name,
+  mb.region_name,
+  mb.sales,
+  mb.quantity,
+  mb.unit_price_derived,
+  mb.promo_flag,
+  mb.lack_of_contribution,
+  -- mb.* except(volume,units,total_volume,volume_source),
+  ma.content as volume,
+  ma.content_unit as units,
+  mem.numerator/mem.denominator as item_count,
+  -- CASE 
+  --       WHEN ma.content_unit = 'KG' THEN ma.content * 1000 * (mem.numerator/mem.denominator)
+  --       WHEN ma.content_unit = 'G'  THEN ma.content * (mem.numerator/mem.denominator)
+  --       WHEN ma.content_unit = 'L'  THEN ma.content * 1000 * (mem.numerator/mem.denominator)
+  --       WHEN ma.content_unit = 'ML' THEN ma.content * (mem.numerator/mem.denominator)
+  --       ELSE ma.content * (mem.numerator/mem.denominator)
+  --   END AS total_volume_gen,
+  case when ma.content_unit is null or ma.content is null then 'no_map'
+       when ma.content_unit = 'EA' AND ma.content > 10 then 'no_map'
+       else 'material_attr' end as volume_source
+  -- ma.conversion_numerator as item_count
+from mapping_base as mb
+left join gold.material.material_attributes as ma
+  ON mb.material_id = ma.material_id
+  AND mb.ean = ma.ean
+  -- AND mb.volume_source = 'no_map'
+left join gold.material.material_ean_master as mem
+  ON mb.material_id = mem.material_id
+  AND mb.ean = mem.ean
+where mb.volume_source = 'no_map'
+)
+
+select
+  *
+from mapping_base 
+where volume_source = 'attribute_extraction'
+union ALL
+select
+  *
+from material_att_map
+""")
+
+
+spark.sql(f"""
+select 
+ sum(sales),
+ count(distinct material_id) as dits_sku
+from {volume_map_inscope}
+where 
+    -- volume_source <> 'no_map' AND
+    promo_flag = 'Non-Promo'
+    AND lack_of_contribution = 0
+""").display()
+spark.sql(f"""
+CREATE OR REPLACE TABLE {volume_classification} AS
+  
+with cte as 
+(
+SELECT *,
+  CASE 
+      WHEN units IN ('KG','L') THEN volume * item_count * 1000
+      WHEN units IN ('Gallon') THEN volume * item_count * 3785.41
+      WHEN units IN ('ML','GM','G') THEN volume * item_count
+      WHEN units IN ('PC','PCS','EA','Sheets') THEN volume * item_count
+  END AS new_volume,
+  CASE 
+      WHEN units IN ('KG','GM','G') THEN 'G'
+      WHEN units IN ('L','Gallon','ML') THEN 'ML'
+      WHEN units IN ('EA','PC','PCS','Sheets') THEN 'PC'
+  END AS new_units
+FROM dev.sandbox.av_setc_volume_mapping
+WHERE volume_source != 'no_map')
+
+,cte2 as 
+(
+select *,
+  case 
+    when Units_no_map in ('KG','L') then Content_no_map * 1000
+    WHEN Units_no_map IN ('Gallon') THEN Content_no_map * 3785.41
+    WHEN Units_no_map IN ('ML','GM','G') THEN Content_no_map
+    WHEN Units_no_map IN ('PC','PCS','EA','Sheets') THEN Content_no_map
+  end as new_volume,
+  CASE 
+    WHEN Units_no_map IN ('KG','GM','G') THEN 'G'
+    WHEN Units_no_map IN ('L','Gallon','ML') THEN 'ML'
+    WHEN Units_no_map IN ('EA','PC','PCS','Sheets') THEN 'PC'
+  END AS new_units
+FROM dev.sandbox.av_setc_volume_mapping -- this is a manually created table that has material_id and material_name mapping 
+WHERE volume_source = 'no_map'
+)
+ 
+
+
+,base as (
+select * 
+from cte 
+union
+select * 
+from cte2
+)
+,global as 
+(
+  select model_name,
+         concat_ws(',', collect_set(concat(material_id,'-',material_name))) as material_set
+  from base 
+  group by model_name
+)
+
+select base.*,global.material_set as material_set
+from base
+left join global 
+on global.model_name = base.model_name
+""")
+
+spark.sql(f"""
+  select 
+    *
+from {volume_classification}      
+-- where material_group_name = 'TEA BAG'
+""").display()
+
+f1 = spark.sql(f"""
+  select 
+    *
+from {volume_classification}      
+where material_group_name = 'TEA BAG'
+""")
+
+f1.toPandas().to_csv('/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/TEA BAG/tea_bag.csv',index=False)
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {weekly_model_wtd_price} AS
+
+with cte as 
+(
+    select sm.*
+    ,mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id)
+    ,new_volume*(numerator/denominator) as ean_volume
+    ,round(sum(amount),2) as sales
+    ,round(sum(amount)/sum(pos.quantity),2) as price
+    
+    from {volume_classification} as sm
+    -- from pl_model_final as sm
+    left join gold.material.material_ean_master mem on sm.material_id = mem.material_id 
+    left join gold.transaction.uae_pos_transactions pos on pos.product_id = mem.material_id and pos.ean = mem.ean 
+    where business_day between '2025-01-01' and current_date and mem.unit != 'ZU'
+    group by all
+),
+
+base as 
+(
+select model_name
+,business_day
+,material_id
+,material_name
+,pos.ean
+,new_units
+,ean_volume
+,round(sum(amount)/sum(pos.quantity),2) as price
+,sum(amount) as sales
+,sum(pos.quantity) as quantity
+,ean_volume
+,round((sum(amount)/sum(pos.quantity))/ean_volume,5) as per_price
+
+from cte pl_ean
+join gold.transaction.uae_pos_transactions pos on pos.product_id = pl_ean.material_id and pos.ean = pl_ean.ean
+
+where business_day between current_date - 735 and current_date-1
+-- business_day between current_date - 365 and current_date-1
+AND amount > 0
+AND bulk_sale_flag is NULL
+AND transaction_type in ('SALE','SELL_MEDIA')
+-- and model_name ilike '%lulu abaya liquid%'
+group by all
+),
+
+last_1_year_weeks AS 
+(
+    SELECT week_label
+    FROM (
+        SELECT DISTINCT week_label 
+        FROM calendar
+        ORDER BY week_label DESC 
+        LIMIT 52
+    ) w
+)
+
+select 
+  model_name,
+  ca.week_label,
+  new_units,
+  round(sum(sales),3) as sales,
+  sum(quantity) as quantity,
+  round(sum(sales)/sum(quantity),3) as unit_price_derived,
+  round(sum(ean_volume * quantity),3) as total_volume,
+  -- round(sum(per_price * quantity)/sum(quantity),5) as new_weighted_per_price,
+  round(sum(sales)/sum(ean_volume * quantity),5) as new_weighted_per_price,
+  case when ca.week_label in (select week_label from last_1_year_weeks) then 1 else 0 end AS last_52_weeks
+
+from base 
+join calendar as ca ON base.business_day = ca.date
+group by 
+  model_name,
+  ca.week_label,
+  new_units
+""")
+
+spark.sql(f"""
+   select
+ *
+from {weekly_model_wtd_price}
+where 
+-- model_name = 'LULU W/POWDER T/L JASMINE'       
+          
+""").display()
+
+
+
+
+spark.sql(f"""
+-- new_weighted_per_price
+CREATE OR REPLACE TABLE {dist_price_points} AS
+
+WITH base_table AS(
+    SELECT
+        model_name,
+        new_units,
+        round(sum(sales),1) as total_sales,
+        sum(quantity) as total_quantity,
+        ROUND(sum(case when last_52_weeks = 1 then sales end),1) as sales_last_1yr,
+        sum(case when last_52_weeks = 1 then quantity end) as total_quantity_last_1yr
+        -- case when last_52_weeks = 1 then round(sum(sales)/sum(quantity),3) end as unit_price_last_1yr
+    FROM {weekly_model_wtd_price}
+    GROUP BY model_name,
+    new_units
+
+),
+
+history_week_sales AS 
+(
+    SELECT
+        model_name,
+        count(DISTINCT week_label) as history_weeks_with_sales
+    FROM {weekly_model_wtd_price}
+    GROUP BY model_name
+),
+
+daily_changes AS (
+    SELECT
+        *,
+        AVG(new_weighted_per_price) OVER (PARTITION BY model_name ) AS avg_weighted_price_per_vol
+    FROM {weekly_model_wtd_price}
+    where last_52_weeks = 1
+),
+
+price_change_calc AS (
+    SELECT
+        *,
+        CASE WHEN avg_weighted_price_per_vol IS NULL THEN NULL ELSE ((new_weighted_per_price - avg_weighted_price_per_vol) / avg_weighted_price_per_vol) * 100
+        END AS price_change_pct
+    FROM daily_changes
+),
+
+valid_price_changes AS (
+    SELECT
+        *,
+        CASE 
+            WHEN ABS(price_change_pct) >= 5 THEN 1
+            ELSE 0
+        END AS is_valid_price_change
+    FROM price_change_calc
+),
+
+sku_valid_changes AS (
+    SELECT
+       *,
+        ROUND(case when is_valid_price_change = 1 then new_weighted_per_price end,3) as new_wtd_per_price_r3
+    FROM valid_price_changes
+    GROUP BY all
+),
+
+
+-- sku_valid_changes AS (
+--     SELECT
+--         model_name,
+--         SUM(is_valid_price_change) AS valid_price_change_points
+--     FROM valid_price_changes
+--     GROUP BY model_name
+-- ),
+
+-- eligible_products AS (
+--     SELECT 
+--       model_name
+--     FROM sku_valid_changes
+--     WHERE valid_price_change_points >= 5
+-- )
+
+eligible_products AS (
+    SELECT 
+      model_name,
+      count(distinct new_wtd_per_price_r3) as valid_price_change_points
+    FROM sku_valid_changes
+    GROUP BY model_name
+    -- having count(distinct new_wtd_per_price_r3) >= 5
+)
+
+SELECT 
+    bt.*,
+    hs.history_weeks_with_sales,
+    v.valid_price_change_points,
+    vc.material_set
+FROM base_table as bt
+LEFT JOIN history_week_sales hs
+    ON bt.model_name = hs.model_name
+-- LEFT JOIN sku_valid_changes v
+--     ON bt.model_name = v.model_name
+LEFT JOIN eligible_products v
+    ON bt.model_name = v.model_name
+LEFT JOIN (select model_name, material_set from {volume_classification} group by all) as vc
+    ON bt.model_name = vc.model_name
+""")
+
+spark.sql(f"""
+select 
+  *
+from {dist_price_points}
+""").display()
+spark.sql(f"""
+select 
+  *
+from {weekly_model_wtd_price}
+where model_name = 'LULU CHAKKI FRESH ATTA'
+""").display()
+spark.sql(f"""
+select 
+  count(distinct model_name) as dist_models,
+sum(sales_last_1yr) as sales_with_pct
+from {dist_price_points}
+where
+valid_price_change_points >= 4
+AND history_weeks_with_sales >= 52
+""").display()
+# -- this is the final table used for modelling 
+
+spark.sql(f"""
+
+CREATE OR REPLACE TABLE {final_table_consecutive_weeks}
+
+select 
+    *
+from {dist_price_points}
+where      
+    valid_price_change_points >= 5
+    and history_weeks_with_sales >= 52
+""").display()
+spark.sql(f"""
+
+SELECT 
+*
+from {final_table_consecutive_weeks}
+
+""").display()
+spark.sql(f"""
+CREATE OR REPLACE TABLE {final_table_ean_list} AS 
+
+with cte1 AS 
+(       
+select 
+  vc.Model_Name,
+  ins.material_id,
+  ins.ean,
+  vc.material_set,
+  ins.material_name,
+  ins.material_group_name,
+  ins.category_name,
+  vc.new_volume,
+  vc.new_units,
+  ROUND(sum(ins.sales),1) AS sales
+from {volume_classification} vc-- 514 skus from excel
+-- from pl_model_final vc
+join {volume_map_inscope} ins
+    ON vc.material_id = ins.material_id
+where ins.promo_flag = 'Non-Promo'
+AND ins.lack_of_contribution = 0
+GROUP BY 
+  vc.Model_Name,
+  ins.material_id,
+  ins.ean,
+  vc.material_set,
+  ins.material_name,
+  ins.material_group_name,
+  ins.category_name,
+  vc.new_volume,
+  vc.new_units
+),
+
+cte2 AS 
+(
+select sm.*,mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id),new_volume*(numerator/denominator) as ean_volume,round(sum(amount),2) as sales,round(sum(amount)/sum(pos.quantity),2) as price
+    from {volume_classification} as sm
+    -- from pl_model_final as sm
+    left join gold.material.material_ean_master mem
+    on sm.material_id = mem.material_id 
+    left join gold.transaction.uae_pos_transactions pos 
+    on pos.product_id = mem.material_id 
+    and pos.ean = mem.ean
+    where business_day between '2025-01-01' and current_date
+    and mem.unit != 'ZU'
+    group by all
+)
+
+select 
+  cte1.*,
+  cte2.unit,
+  cte2.numerator,
+  cte2.denominator,
+  cte2.ean_volume,
+  tb3.valid_price_change_points,
+  tb3.history_weeks_with_sales
+from cte1
+left join cte2
+  ON cte1.material_id = cte2.material_id
+  and cte1.ean = cte2.ean
+LEFT JOIN {dist_price_points} as tb3
+  ON cte1.model_name = tb3.model_name
+""").display()
+spark.sql(f"""
+select 
+    -- count(distinct material_group_name)
+    *
+from {final_table_ean_list}
+-- where      
+--     valid_price_change_points < 5
+--     or history_weeks_with_sales < 52
+""").display()
+export_final_list = spark.sql(f"""
+select 
+    model_name,
+    material_group_name,
+    category_name,
+    new_units,
+    valid_price_change_points,
+    history_weeks_with_sales,
+    ROUND(SUM(sales),0) as sales,
+    SUM(ean_volume) as total_ean_volume,
+    case when valid_price_change_points >= 5 AND history_weeks_with_sales >= 52 then 1 else 0 end as model_scoped
+from {final_table_ean_list}
+GROUP BY 
+    model_name,
+    material_group_name,
+    category_name,
+    new_units,
+    valid_price_change_points,
+    history_weeks_with_sales
+""")
+
+# export_final_list.toPandas().to_csv('/Workspace/Users/811991@lulumea.com/Exported Files/export_pl_setc_final_model_list.csv', index=False)
+export_final_list.write.mode('overwrite').option("overwriteSchema",True).saveAsTable(final_models_list)
+export_final_list.display()
+%md
+# Selecting Models and MG
+spark.sql(f"""
+
+SELECT 
+*
+from {final_table_consecutive_weeks}
+
+""").display()
+spark.sql(f"""
+select 
+    -- count(distinct material_group_name)
+    *
+from {final_table_ean_list}
+-- where      
+--     valid_price_change_points >= 5
+--     AND history_weeks_with_sales >= 52
+""").display()
+selected_mg = 'DISPSBL.VINYL GLOVES'
+f1 = spark.sql(f"""
+  select 
+    *
+from {volume_classification}      
+where material_group_name = '{selected_mg}'
+""")
+f1.display()
+f1.toPandas().to_csv(f'/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/MG Input/{selected_mg}.csv',index=False)
+
+# pl_model_data = pd.read_csv('/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/TEA BAG/tea_bag.csv')
+# pl_model_data = pd.read_csv('/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/MG Input/disinfectants.csv')
+
+# selected_mg = 'SALT'
+pl_model_data = pd.read_csv(f'/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/MG Input/{selected_mg}.csv')
+pl_model_data.head(5)
+
+pl_model_spark = spark.createDataFrame(pl_model_data)
+
+pl_model_spark.createOrReplaceTempView('pl_model_final')
+pl_model_spark.display()
+scoping_final_tb = spark.sql(f"""
+                             
+with pct_num_den AS 
+(
+select 
+    sm.*except(sales,quantity,unit_price_derived),
+    mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id),
+    new_volume*(numerator/denominator) as ean_volume,
+    round(sum(amount),2) as sales,
+    sum(pos.quantity) as quantity,
+    -- round(sum(amount)/sum(pos.quantity),2) as price,
+    round(sum(amount)/sum((new_volume*(numerator/denominator)) * pos.quantity),5) as per_vol_price
+  -- from {volume_classification} as sm
+  from pl_model_final as sm
+  left join gold.material.material_ean_master mem
+  on sm.material_id = mem.material_id 
+  left join gold.transaction.uae_pos_transactions pos 
+  on pos.product_id = mem.material_id 
+  and pos.ean = mem.ean
+  where business_day between current_date -365 and current_date
+  and pos.amount > 0
+  and pos.quantity > 0
+  and mem.unit != 'ZU'
+  and pos.bulk_sale_flag is null
+  and upper(pos.transaction_type) in ('SALE','SALE_MEDIA')
+  group by all
+)
+
+select
+    pc.*,
+    tb3.valid_price_change_points,
+    tb3.history_weeks_with_sales
+from pct_num_den as pc
+LEFT JOIN {dist_price_points} as tb3
+  ON pc.model_name = tb3.model_name
+-- where 
+--     tb3.valid_price_change_points >= 5
+--     AND tb3.history_weeks_with_sales >= 52
+""")
+
+scoping_final_tb.write.mode('append').option("mergeSchema", "true").saveAsTable(master_scope_tb)
+scoping_final_tb.display()
+%sql
+select 
+*
+from dev.sandbox.sd_pl_scoping_master_vol_ean
+-- where 
+--   material_group_name = 'SALT'
+--   and valid_price_change_points >= 5
+--   and history_weeks_with_sales >= 52
+# scoping_final_tb1 = spark.sql(f"""
+                             
+# select 
+#     *
+# from {master_scope_tb}
+# where material_group_name <> 'SUGAR&CHOCO CEREALS'
+# --     tb3.valid_price_change_points >= 5
+# --     AND tb3.history_weeks_with_sales >= 52
+# """)
+
+# scoping_final_tb1.write.mode('overwrite').option("mergeSchema", "true").saveAsTable(master_scope_tb)
+%md
+# Competitor Mapping
+pl_model_data = pd.read_csv(
+    '/Workspace/Users/811991@lulumea.com/Pricing/PL Price Recommendation Set-C/TEA BAG/tea_bag_competitor.csv',
+    sep='\t',        # tab-separated values
+    engine='python'
+)
+
+pl_model_data.head()
+
+
+pl_model_spark = spark.createDataFrame(pl_model_data)
+
+pl_model_spark.createOrReplaceTempView('pl_model_final')
+material_group_name = 'tea_bags'
+
+%sql
+select * 
+from pl_model_final
+spark.sql(f"""
+CREATE OR REPLACE TABLE {final_table_ean_list_mg} AS 
+
+with pct_num_den AS 
+(
+select sm.*except(sales,quantity),mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id),(item_count*volume)*(numerator/denominator) as ean_volume
+    -- from {volume_classification} as sm
+    from pl_model_final as sm
+    left join gold.material.material_ean_master mem
+    on sm.material_id = mem.material_id 
+    left join gold.transaction.uae_pos_transactions pos 
+    on pos.product_id = mem.material_id 
+    and pos.ean = mem.ean
+    where business_day between current_date -365 and current_date
+    and mem.unit != 'ZU'
+    group by all
+)
+
+select
+    *
+from pct_num_den 
+""").display()
+spark.sql(f"""
+select 
+--  distinct model_name, material_id
+*
+from {final_table_ean_list_mg}
+
+""").display()
+%md
+# Rough Work
+
+%sql
+with cte as 
+(
+    select sm.*,mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id),new_volume*(numerator/denominator) as ean_volume,round(sum(amount),2) as sales,round(sum(amount)/sum(pos.quantity),2) as price
+    from dev.sandbox.sd_pl_setc_volume_model_map_check as sm
+    left join gold.material.material_ean_master mem
+    on sm.material_id = mem.material_id 
+    left join gold.transaction.uae_pos_transactions pos 
+    on pos.product_id = mem.material_id 
+    and pos.ean = mem.ean
+    where business_day between '2025-01-01' and current_date
+    and mem.unit != 'ZU'
+    group by all
+)
+
+select * 
+from cte
+order by material_group_name,material_id
+%sql
+WITH daily_changes AS (
+    SELECT
+        *,
+        LAG(weighted_price_per_vol) OVER (PARTITION BY model_name ORDER BY business_day) AS prev_wtd_price_per_vol
+    FROM dev.sandbox.sd_pl_setc_volume_model_map_check_price1
+),
+
+price_change_calc AS (
+    SELECT
+        *,
+        CASE 
+            WHEN prev_wtd_price_per_vol IS NULL THEN NULL
+            ELSE ((weighted_price_per_vol - prev_wtd_price_per_vol) / prev_wtd_price_per_vol) * 100
+        END AS price_change_pct
+    FROM daily_changes
+),
+
+valid_price_changes AS (
+    SELECT
+        *,
+        CASE 
+            WHEN ABS(price_change_pct) >= 5 THEN 1
+            ELSE 0
+        END AS is_valid_price_change
+    FROM price_change_calc
+),
+
+sku_valid_changes AS (
+    SELECT
+        model_name,
+        SUM(is_valid_price_change) AS valid_price_change_points
+    FROM valid_price_changes
+    GROUP BY model_name
+),
+
+eligible_products AS (
+    SELECT 
+      model_name
+    FROM sku_valid_changes
+    WHERE valid_price_change_points >= 5
+)
+
+SELECT 
+  v.model_name
+FROM valid_price_changes v
+JOIN eligible_products e
+ON v.model_name = e.model_name
+GROUP BY v.model_name 
+-- ORDER BY v.model_name, v.business_day;
+
+%sql
+CREATE OR REPLACE TABLE dev.sandbox.sd_pl_setc_volume_model_map_check_price2 AS
+
+with cte as 
+(
+    select sm.*,mem.*except(insert_Date,insert_utc_timestamp,material_name,material_id),new_volume*(numerator/denominator) as ean_volume,round(sum(amount),2) as sales,round(sum(amount)/sum(pos.quantity),2) as price
+    from dev.sandbox.sd_pl_setc_volume_model_map_check as sm
+    left join gold.material.material_ean_master mem
+    on sm.material_id = mem.material_id 
+    left join gold.transaction.uae_pos_transactions pos 
+    on pos.product_id = mem.material_id 
+    and pos.ean = mem.ean
+    where business_day between '2025-01-01' and current_date
+    and mem.unit != 'ZU'
+    group by all
+),
+
+base as 
+(
+select model_name,business_day,material_id,material_name,pos.ean,new_units,ean_volume,round(sum(amount)/sum(pos.quantity),2) as price,sum(amount) as sales,sum(pos.quantity) as quantity,ean_volume,round((sum(amount)/sum(pos.quantity))/ean_volume,5) as per_price
+from cte pl_ean
+join gold.transaction.uae_pos_transactions pos 
+on pos.product_id = pl_ean.material_id 
+and pos.ean = pl_ean.ean
+where business_day between current_date - 365 and current_date-1
+AND amount > 0
+AND bulk_sale_flag is NULL
+AND transaction_type in ('SALE','SELL_MEDIA')
+-- and model_name ilike '%lulu abaya liquid%'
+group by all
+)
+
+select 
+  model_name,
+  business_day,
+  new_units,
+  round(sum(sales),3) as sales,
+  sum(quantity) as quantity,
+  round(sum(sales)/sum(quantity),3) as unit_price_derived,
+  round(sum(per_price * quantity)/sum(quantity),5) as new_weighted_per_price,
+  round(sum(per_price*ean_volume)/sum(ean_volume),2) as ean_volume,
+  round(sum(ean_volume * quantity)/sum(quantity),3) as weighted_avg_vol,
+  round((sum(sales)/sum(quantity))/weighted_avg_vol,5) as weighted_price_per_vol,
+  round(sum(ean_volume),2) as total_vol_sold,
+  round((sum(sales)/sum(quantity))/sum(ean_volume),5) as per_vol_price
+from base 
+group by all
+
+%sql
+select 
+  category_name,
+  material_group_name,
+  sum(sales) as sales
+From dev.sandbox.sd_pl_setc_scoping_vol_final_ean
+where valid_price_change_points >= 5
+AND history_weeks_with_sales >= 52
+GROUP BY category_name, material_group_name
+%sql
+CREATE OR REPLACE TABLE dev.sandbox.sd_pl_setc_scoping_comp_sku_vol AS
+with material_rank AS (
+select 
+  mm.category_name,
+  mm.material_group_name,
+  s.product_id as material_id,
+  mm.material_name,
+  -- week_label as week_number,
+  -- count(distinct product_id) as competitors,
+  round(sum(amount),1) as sales,
+  round(sum(quantity),1) as quantity,
+  round(sum(amount)/sum(quantity),2) as avg_unit_price,
+  rank() over(partition by mm.material_group_name order by sum(amount) desc) as sku_rank_by_mg 
+  from gold.transaction.uae_pos_transactions s 
+  -- join calendar c on c.date = s.business_day
+  join gold.material.material_master mm 
+  on mm.material_id = s.product_id
+  -- and material_group_name in (
+  --   select 
+  --     distinct material_group_name 
+  --   from dev.sandbox.sd_pl_setc_scoping_vol_final_ean
+  --   where valid_price_change_points >= 5
+  --     AND history_weeks_with_sales >= 52
+  -- )
+  left join gold.store.store_master sm 
+  on sm.store_id = s.store_id
+  where 1 = 1
+  and business_day between '2022-10-13' and '2025-10-09'
+  and (brand not ilike '%lulu%')
+  and material_group_name in (
+    select 
+      distinct material_group_name 
+    from dev.sandbox.sd_pl_setc_scoping_vol_final_ean
+    where 
+    -- valid_price_change_points >= 5
+    -- AND history_weeks_with_sales >= 52
+    valid_price_change_points < 5
+    OR history_weeks_with_sales < 52
+
+    AND NOT (LOWER(material_name) LIKE '%+%'
+    OR LOWER(material_name) LIKE '% po'
+    OR LOWER(material_name) LIKE '%offer%'
+    OR LOWER(material_name) LIKE '%ofr%'
+    OR LOWER(material_name) LIKE '%offr%'
+    OR LOWER(material_name) LIKE '%p/o%')
+  )
+  group by 
+    mm.category_name,
+    mm.material_group_name, 
+    s.product_id,
+    mm.material_name
+)
+
+select 
+*
+from material_rank
+-- where sku_rank_by_mg <= 8
+%sql
+select 
+-- count(distinct material_group_name)
+-- count(*)
+*
+from dev.sandbox.sd_pl_setc_scoping_comp_sku_vol 
+-- where 
+-- NOT (LOWER(material_name) LIKE '%+%'
+--   OR LOWER(material_name) LIKE '% po'
+--   OR LOWER(material_name) LIKE '%offer%'
+--   OR LOWER(material_name) LIKE '%ofr%'
+--   OR LOWER(material_name) LIKE '%offr%'
+--   OR LOWER(material_name) LIKE '%p/o%')
+%sql
+select 
+    sc.*,
+    am.attr_1 as volume,
+    am.attr_2 as units,
+    am.attr_3 as item_count
+from dev.sandbox.sd_pl_setc_scoping_comp_sku_vol as sc
+left join dev.sandbox.pj_attributes_master as am
+    on sc.material_id = am.material_id
+
+-- where am.material_group_name = 'TEA BAG'
+where 
+-- and attr_3 not in ('item_count','nan')
+AND NOT (LOWER(sc.material_name) LIKE '%+%'
+  OR LOWER(sc.material_name) LIKE '% po'
+  OR LOWER(sc.material_name) LIKE '%offer%'
+  OR LOWER(sc.material_name) LIKE '%ofr%'
+  OR LOWER(sc.material_name) LIKE '%offr%'
+  OR LOWER(sc.material_name) LIKE '%p/o%')
+comp_data = """
+select 
+    sc.*,
+    am.attr_1 as volume,
+    am.attr_2 as units,
+    am.attr_3 as item_count
+from dev.sandbox.sd_pl_setc_scoping_comp_sku_vol as sc
+left join dev.sandbox.pj_attributes_master as am
+    on sc.material_id = am.material_id
+-- where
+--  NOT (LOWER(sc.material_name) LIKE '%+%'
+--   OR LOWER(sc.material_name) LIKE '% po'
+--   OR LOWER(sc.material_name) LIKE '%offer%'
+--   OR LOWER(sc.material_name) LIKE '%ofr%'
+--   OR LOWER(sc.material_name) LIKE '%offr%'
+--   OR LOWER(sc.material_name) LIKE '%p/o%')
+"""
+
+comp_data_df = spark.sql(comp_data)
+comp_data_df.toPandas().to_csv('/Workspace/Users/811991@lulumea.com/Exported Files/comp_setc_non_scoped_data.csv', index=False)
+
+%sql
+select 
+    sc.*,
+    am.*
+from dev.sandbox.sd_pl_setc_scoping_comp_sku_vol as sc
+left join dev.sandbox.pj_attributes_master as am
+    on sc.material_id = am.material_id
+where am.material_group_name = 'TEA BAG'
+
+%sql
+select 
+sm.region_name,
+sum(total_discount) as tot_disc
+from analytics.campaign.jk_promo_transactions b
+join gold.store.store_master sm ON sm.store_id = b.store_id
+  WHERE b.disc_perc IS NOT NULL 
+  AND b.product_id = 304447
+  AND b.ean = 6294011684432
+  AND business_day >= '2025-09-04' AND business_day <= '2025-09-10'
+GROUP BY sm.region_name
+%sql
+select 
+*
+from dev.sandbox.sd_mds_weekly_pl_tea_bags
+%sql
+
+select 
+*
+from dev.sandbox.sd_pl_final_iterations_tea_bags
+set = 'pl_tea_bags'
+spark.sql(f'SELECT * FROM dev.sandbox.sd_mds_weekly_{set}').display()
+df_final = spark.sql(f'SELECT * FROM dev.sandbox.sd_mds_weekly_{set}').toPandas()
+df_final.columns
+spark.sql(f"""
+select 
+    -- count(distinct material_group_name)
+    model_name,
+    sum(sales) as sales
+from {final_table_ean_list}
+-- where      
+--     valid_price_change_points >= 5
+--     AND history_weeks_with_sales >= 52
+where      
+    valid_price_change_points < 5
+    OR history_weeks_with_sales < 52
+GROUP BY 
+    model_name
+""").display()
+spark.sql(f"""
+select 
+   *
+from {final_table_ean_list}
+-- where      
+--     valid_price_change_points >= 5
+--     AND history_weeks_with_sales >= 52
+-- where      
+--     valid_price_change_points < 5
+--     OR history_weeks_with_sales < 52
+-- GROUP BY 
+--     model_name
+""").display()
+export_final_list = spark.sql(f"""
+select 
+    model_name,
+    material_group_name,
+    category_name,
+    new_units,
+    valid_price_change_points,
+    history_weeks_with_sales,
+    ROUND(SUM(sales),0) as sales,
+    SUM(ean_volume) as total_ean_volume,
+    case when valid_price_change_points >= 5 AND history_weeks_with_sales >= 52 then 1 else 0 end as model_scoped
+from {final_table_ean_list}
+GROUP BY 
+    model_name,
+    material_group_name,
+    category_name,
+    new_units,
+    valid_price_change_points,
+    history_weeks_with_sales
+""")
+
+export_final_list.toPandas().to_csv('/Workspace/Users/811991@lulumea.com/Exported Files/export_pl_setc_final_model_list.csv', index=False)
+export_final_list.display()

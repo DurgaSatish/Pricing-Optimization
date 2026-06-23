@@ -1,0 +1,2751 @@
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+import pyspark.sql.functions as psf
+
+import os
+import numpy as np
+
+import pandas as pd
+import re
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
+from itertools import combinations
+
+spark = SparkSession.builder.getOrCreate()
+spark.sql("SET spark.databricks.delta.schema.autoMerge.enabled = false")
+# set = 'pl_tea_bags'
+# set = 'pl_disinfectants'
+# mg = 'disinfectants'
+# selected_mg = 'COFFEE'
+# selected_mg = 'SALT'
+# selected_mg = 'SUGAR&CHOCO CEREALS'
+# selected_mg = 'LIQUID DETERGENT'
+# selected_mg = 'BOUGHT IN CAKES'
+# selected_mg = 'WASHING PWDR T.LOAD'
+# selected_mg = 'BLACK TEA'
+# selected_mg = 'ALUMINIUM FOIL'
+# selected_mg = 'LADIES HAIR REMOVERS'
+# selected_mg = 'COTTON BUDS'
+# selected_mg = 'BOUGHT IN CROISSANT'
+# selected_mg = 'PLATES & TRAYS'
+# selected_mg = 'GREEN TEA'
+# selected_mg = 'CUPS & GLASSES'
+# selected_mg = 'NAPHTHALENE'
+# selected_mg = 'COFFEE CREAMERS'
+# selected_mg = 'STUFFING&SEASON.MIXE'
+# selected_mg = 'INSECTICIDES'
+# selected_mg = 'LIQUID HAND WASH'
+# selected_mg = 'CAKE & DESSERT MIXES'
+# selected_mg = 'WASHING PWDR F.LOAD'
+# selected_mg = 'DISP.CLEANING WIPES'
+# selected_mg = 'TOILET BLOCKS'
+# selected_mg = 'SPIRALS'
+# selected_mg = 'LADIES SHAVERS'
+# selected_mg = 'CORN FLAKES'
+# selected_mg = 'FLOUR'
+# selected_mg = 'OTHER COTTON PRODUCT'
+# selected_mg = 'OTHER DISPOSABLES'
+# selected_mg = 'MUESLI'
+# selected_mg = 'NAIL SAVER'
+# selected_mg = 'SCOURING CREAMS'
+# selected_mg = 'CEREAL BARS'
+# selected_mg = 'OATS'
+# selected_mg = 'CUP NOODLE'
+# selected_mg = 'DISPSBL.LATEX GLOVES'
+# selected_mg = 'TABLE MATS & DOYLEYS'
+selected_mg = 'DISPSBL.VINYL GLOVES'
+# Base_table = f'dev.sandbox.sd_pl_setc_{mg}_scoping_vol_final_ean'
+
+Base_table = f'dev.sandbox.sd_pl_scoping_master_vol_ean'
+txn_data_raw_dg_poc_name = f'dev.sandbox.sd_pl_mds_txn_level_mg'
+
+# txn_data_raw_dg_poc_name = f'dev.sandbox.sd_txn_level_{set}' # Transaction data for the modelling
+# attr_level_details = f'dev.sandbox.sd_pricing_{set}_attr'
+promo_table = f'analytics.campaign.jk_promo_transactions' # Promo table
+weekly_weather_data  =f'dev.sandbox.sd_weekly_weather_data' # Storing weather data
+# moving_average = f'dev.sandbox.sd_moving_average_weekly_{set}'
+# seasonality_table = f'dev.sandbox.sd_spark_df_seasonality_idx_{set}' # Seasonality table for the MDS run
+
+mds_material_week_region = f'dev.sandbox.sd_pl_mds_weekly_mg'
+
+# mds_material_week_region = f'dev.sandbox.sd_mds_weekly_{set}' # Final table for MDS - Week - Region
+# mds_material_week_uae = f'dev.sandbox.sd_mds_week_level_{set}' # Final table for MDS - Week - UAE
+
+# master_table_mg_region = f'dev.sandbox.sd_mg_region_week_{set}' # Final table for MDS - MG - Region
+# master_table_mg_uae = f'dev.sandbox.sd_mg_uae_week_{set}' # Final table for MDS - UAE - Week
+
+spark.sql(f"select * from {Base_table} where material_group_name = '{selected_mg}'").display()
+today = date.today()
+# CURR_DATE = today.strftime("%Y%m%d")
+
+# date boundaries for the MDS run
+# START_DATE = '2023-06-05'
+# END_DATE = '2025-06-01'
+CURR_DATE = today.strftime("%Y-%m-%d")
+END_DATE = (datetime.strptime(CURR_DATE, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+START_DATE = (datetime.strptime(END_DATE, "%Y-%m-%d") - timedelta(days=1092)).strftime("%Y-%m-%d")
+
+print("\t Current date: {}".format(CURR_DATE))
+print("\t Processing data from: {}".format(START_DATE))
+print("\t Processing data till: {}".format(END_DATE))
+
+print("\t Number of days: {}".format((datetime.strptime(END_DATE, "%Y-%m-%d") - datetime.strptime(START_DATE, "%Y-%m-%d")).days+1))
+import pandas as pd
+import builtins
+
+# Function to generate dates for a given year, excluding Feb 28 and Feb 29
+def generate_dates(year):
+    dates = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31", freq='D')
+    return dates[~((dates.month == 2) & (dates.day.isin([28, 29])))]
+
+# Generate date series for all years
+dates_2022 = pd.Series(generate_dates(2022))
+dates_2023 = pd.Series(generate_dates(2023))
+dates_2024 = pd.Series(generate_dates(2024))
+dates_2025 = pd.Series(generate_dates(2025))
+
+# Determine the maximum length
+max_len = builtins.max(len(dates_2022), len(dates_2023), len(dates_2024), len(dates_2025))
+
+# Reindex to make all series the same length
+dates_2022 = dates_2022.reindex(range(max_len))
+dates_2023 = dates_2023.reindex(range(max_len))
+dates_2024 = dates_2024.reindex(range(max_len))
+dates_2025 = dates_2025.reindex(range(max_len))
+
+# Create the wide-format calendar
+calendar_df = pd.DataFrame({
+    "2022": dates_2022,
+    "2023": dates_2023,
+    "2024": dates_2024,
+    "2025": dates_2025
+})
+
+calendar_df["week_number"] = (calendar_df.index // 7) + 1
+
+# Melt to long format
+melted_df = pd.melt(calendar_df, id_vars="week_number",
+                    value_vars=["2022", "2023", "2024", "2025"],
+                    var_name="year", value_name="date")
+
+# Drop rows with missing dates
+melted_df = melted_df.dropna(subset=["date"])
+
+# Add week label and format date
+melted_df["week_label"] = melted_df.apply(
+    lambda row: f"{row['year']}-W{int(row['week_number']):02}", axis=1)
+
+melted_df["date"] = melted_df["date"].dt.strftime('%Y-%m-%d')
+
+# Final output
+final_df = melted_df[["date", "week_label"]].sort_values(["week_label", "date"]).reset_index(drop=True)
+spark_df = spark.createDataFrame(final_df)
+spark_df.createOrReplaceTempView('calendar')
+%sql
+with cte as 
+(
+select week_label,count(distinct date) as cnt
+from calendar 
+group by all
+order by 2 desc
+)
+
+select min(cnt),max(cnt)
+from cte
+%sql
+select 
+*
+from calendar
+raw_txn_query = f"""
+  with trans_data_raw as (
+  select
+    transaction_id,
+    business_day,
+    model_name,
+    week_label as  week_number,
+    CONCAT(YEAR(business_day), '-M', LPAD(month(business_day), 2, '0')) as month_number,
+    customer_id,
+    dayofmonth(business_day) as day_month,
+    product_id as material_id,
+    quantity,
+    amount,
+    store_id,
+    store_name,
+    region_name,
+    material_group_name,
+    material_name,
+    unit_price,
+    regular_unit_price,
+    actual_unit_price,
+    coalesce(item_discount_amount,0) as item_discount_amount,
+    ean,
+    category_name
+  from(
+    select
+      t1.*,
+      t2.*,
+      t3.store_name,
+      t3.region_name,
+      c.week_label,
+      bt.model_name
+    from
+      gold.transaction.uae_pos_transactions t1
+      join calendar c on c.date = t1.business_day 
+      join gold.material.material_master t2 on t1.product_id = t2.material_id
+      join gold.store.store_master t3 on t1.store_id = t3.store_id
+      join {Base_table} bt on bt.material_id =t1.product_id and bt.ean = t1.ean
+    where
+      t1.business_day >= '{START_DATE}'
+      and t1.business_day <= '{END_DATE}'
+      and round(t1.amount, 2) > 0
+      and t1.quantity > 0
+      and valid_price_change_points >= 5
+      AND history_weeks_with_sales >= 52 
+      AND bt.material_group_name = '{selected_mg}'
+      --and ( (t1.product_id,t1.ean, t3.region_name) in (select material_id, ean, region_name from {Base_table}))
+      --and t3.region_name in ('DUBAI','SHARJAH','ABU DHABI','AL AIN')
+      and bulk_sale_flag is null
+      and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+    )
+    group by all
+  )
+
+select * from trans_data_raw
+"""
+
+df_trans_level_raw = spark.sql(raw_txn_query)
+
+print('txn table name: ', txn_data_raw_dg_poc_name)
+
+# df_trans_level_raw.write.option("overwriteSchema", "true").mode("overwrite").saveAsTable(txn_data_raw_dg_poc_name)
+df_trans_level_raw.write.option("mergeSchema", "true").mode("append").saveAsTable(txn_data_raw_dg_poc_name)
+df_trans_level_raw.display()
+%md
+# Material - Weekly - Region
+# weekly_sales_info_query = f"""
+# with weekly_sales_info as (
+#   SELECT
+#     week_number,
+#     model_name,
+#     ean,
+#     material_id,
+#     material_name,
+#     material_group_name,
+#     category_name,
+#     region_name,
+#     round(sum(amount),2) as sales,
+#     count(distinct transaction_id) as num_txns,
+#     sum(quantity) as quantity,
+#     round(sum(amount)/sum(quantity),2) as avg_unit_price,
+#     round(avg(regular_unit_price),2) as avg_regular_unit_price,
+#     round(avg(actual_unit_price),2) as avg_actual_unit_price,
+#     count(distinct store_id) as num_stores,
+#     count(distinct case when day_month in (31,30,1,2,3,4,5) then business_day end) as pay_days 
+#   FROM
+#     {txn_data_raw_dg_poc_name}
+#   WHERE material_group_name = '{selected_mg}'
+#   GROUP BY
+#     week_number,
+#     ean,
+#     material_id,
+#     model_name,
+#     material_name,
+#     material_group_name,
+#     category_name,
+#     region_name
+#     ),
+# holiday_info as (
+#   select holiday_week, count(holiday_date) as num_holidays
+#   from (select holiday_year,
+#         cast(holiday_date as date) as holiday_date,
+#         CONCAT(YEAR(holiday_date), '-W', LPAD(weekofyear(holiday_date), 2, '0')) as holiday_week,
+#         holiday_desc
+#         from dev.sandbox.pg_uae_holiday_list)
+#   group by holiday_week
+# )
+
+# select t1.*,
+# case when t4.num_holidays is null then 0 else 1 end as has_holidays
+# from weekly_sales_info t1
+# left join holiday_info t4
+# on t1.week_number = t4.holiday_week
+# order by t1.material_id, t1.week_number,material_group_name
+# """
+
+# df_weekly_sales = spark.sql(weekly_sales_info_query)
+# # df_weekly_sales.write.option("overwriteSchema", "true").mode("overwrite").saveAsTable(f'dev.sandbox.sd_{set}')
+# df_weekly_sales.display()
+spark_model = f"""
+with weekly_sales_info as (
+select 
+    week_number,
+    txn.model_name,
+    region_name,
+    txn.material_group_name,
+    txn.category_name,
+    round(sum(amount),2) as sales,
+    count(distinct transaction_id) as num_txns,
+    sum(txn.quantity) as quantity,
+    round(sum(amount)/sum(txn.quantity),2) as avg_unit_price,
+    count(distinct store_id) as num_stores,
+    count(distinct case when day_month in (31,30,1,2,3,4,5) then business_day end) as pay_days,
+    vol.new_units as units,
+    round(sum(ean_volume * txn.quantity),3) as total_volume,
+    round(sum(amount)/sum(ean_volume * txn.quantity),5) as per_vol_price,
+    concat_ws(',', collect_set(concat(vol.material_id,'-',vol.material_name))) as material_set
+from {txn_data_raw_dg_poc_name} txn
+left join {Base_table} vol ON txn.material_id = vol.material_id and txn.ean = vol.ean 
+Where 
+  vol.valid_price_change_points >= 5 
+  AND vol.history_weeks_with_sales >= 52
+  AND txn.material_group_name = '{selected_mg}'
+  AND vol.material_group_name = '{selected_mg}'
+GROUP BY 
+    week_number,
+    txn.model_name,
+    region_name,
+    txn.material_group_name,
+    txn.category_name,
+    vol.new_units
+),
+
+holiday_info as (
+  select holiday_week, count(holiday_date) as num_holidays
+  from (select holiday_year,
+        cast(holiday_date as date) as holiday_date,
+        CONCAT(YEAR(holiday_date), '-W', LPAD(weekofyear(holiday_date), 2, '0')) as holiday_week,
+        holiday_desc
+        
+        -- not sure who is the owner of this table 
+        from dev.sandbox.pg_uae_holiday_list)
+  
+  group by holiday_week
+)
+
+select t1.*,
+case when t4.num_holidays is null then 0 else 1 end as has_holidays
+from weekly_sales_info t1
+left join holiday_info t4 on t1.week_number = t4.holiday_week
+
+"""
+
+model_wk_reg = spark.sql(spark_model)
+model_wk_reg.createOrReplaceTempView('region_weekly_sales_info')
+model_wk_reg.display()
+df = spark.sql("""
+    SELECT
+        week_number, region_name, model_name,
+        COUNT(*) as c1
+    FROM region_weekly_sales_info
+    GROUP BY week_number, region_name, model_name
+    HAVING COUNT(*) > 1
+""").display()
+
+# if df.count() > 0:
+#     raise ValueError("Duplicate records found for week_number, region_name, material_id in region_weekly_sales_info.")
+
+try:
+    if df is None:
+        raise ValueError("DataFrame is None (query returned nothing).")
+
+    if not df.rdd.isEmpty():
+        raise ValueError("Duplicate records found for week_number, region_name, material_id in region_weekly_sales_info")
+
+except Exception as e:
+    dbutils.notebook.exit(f"ERROR: {str(e)}")   # or log to Delta/logging system
+
+# weekly_competitors_info_query = f"""
+# with weekly_competitors_info as 
+# (
+#     select  
+#     --mm.material_group_name,
+#         comp.model_name,
+#         region_name,
+#         week_label as week_number,
+#         count(distinct product_id) as competitors,
+#         round(sum(amount)/sum(comp.ean_volume * quantity),5) as comp_per_vol_price
+#     from gold.transaction.uae_pos_transactions s 
+#     join calendar c on c.date = s.business_day
+#     join gold.material.material_master mm 
+#     on mm.material_id = s.product_id
+#     -- join dev.sandbox.sd_pl_setc_tea_bags_scoping_vol_final_ean_comp comp 
+#     -- on comp.material_id = s.product_id 
+#     -- and comp.ean = s.ean
+#     left join gold.store.store_master sm 
+#     on sm.store_id = s.store_id
+#     where 1 = 1
+#         and business_day between '{START_DATE}' and '{END_DATE}'
+#         and brand not ilike '%lulu%'
+#         and mm.material_group_name = '{selected_mg}'
+#     group by all
+# )
+
+# select * 
+# from weekly_competitors_info
+# """
+
+# weekly_competitors_info = spark.sql(weekly_competitors_info_query)
+# weekly_competitors_info.createOrReplaceTempView('weekly_competitors_info')
+# weekly_competitors_info.display()
+# from pyspark.sql import SparkSession
+
+# spark = SparkSession.builder.getOrCreate()
+
+# # Run your SQL
+# df = spark.sql("""
+#     SELECT
+#         week_number,
+#         region_name,
+#         model_name,
+#         COUNT(*) as c1
+#     FROM weekly_competitors_info
+#     GROUP BY week_number, region_name,model_name
+#     HAVING COUNT(*) > 1
+# """)
+
+# # Check and raise
+# if df.count() > 0:
+#     raise ValueError("Duplicate rows found in weekly_competitors_info for the same week_number, region_name, and material_group_name.")
+weekly_discount_info_query = f"""
+WITH weekly_discount_info AS (
+  SELECT
+    c.week_label as week_number,
+    a.model_name,
+    sm.region_name,
+    COALESCE(ROUND(SUM(b.total_discount), 2), 0) AS total_discount,
+    COALESCE(COUNT(DISTINCT b.store_id), 0) AS num_stores_discount,
+    case when ROUND(SUM(b.total_discount)) > 0 then 1 else 0 end as promo_flag
+    
+    FROM {Base_table} a
+    JOIN {promo_table} b ON b.product_id = a.material_id and b.ean = a.ean
+    join calendar c on b.business_day = c.date
+    left join gold.store.store_master sm ON sm.store_id = b.store_id
+    
+    WHERE b.disc_perc IS NOT NULL 
+      AND a.valid_price_change_points >= 5 
+      AND a.history_weeks_with_sales >= 52
+      AND a.material_group_name = '{selected_mg}'
+  GROUP BY all
+)
+
+SELECT 
+*
+FROM weekly_discount_info
+"""
+
+df_weekly_discount = spark.sql(weekly_discount_info_query)
+
+df_weekly_discount.createOrReplaceTempView('region_weekly_discount_info')
+display(df_weekly_discount)
+df = spark.sql("""
+    SELECT
+        week_number,
+        region_name,
+        model_name,
+        COUNT(*) AS c1
+    FROM region_weekly_discount_info
+    GROUP BY week_number, region_name, model_name
+    HAVING COUNT(*) > 1
+""")
+
+if df.count() > 0:
+    raise ValueError("Duplicate rows found in region_weekly_discount_info for week_number, region_name, and material_id.")
+# df_weekly_discount_competitor_query = f"""
+# with comp_disc_tb as 
+# (
+# select 
+#     comp.model_name,
+#     region_name, 
+#     week_label as week_number,
+#     ROUND(sum(total_discount),1) as comp_total_discount,
+#     count(distinct promo.store_id) as comp_disc_stores
+# from {promo_table} promo 
+# join calendar c on promo.business_day = c.date
+# join gold.material.material_master mm
+# on mm.material_id = promo.product_id
+# join dev.sandbox.sd_pl_setc_tea_bags_scoping_vol_final_ean_comp comp 
+#     on comp.material_id = promo.product_id 
+#     and comp.ean = promo.ean
+# join gold.store.store_master sm 
+# on sm.store_id = promo.store_id
+# where brand not ilike '%lulu%'
+# and promo.disc_perc is not null
+# group by all
+# )
+
+
+# select 
+# *
+# FROM comp_disc_tb
+
+# """
+
+# df_weekly_discount_competitor = spark.sql(df_weekly_discount_competitor_query)
+
+# df_weekly_discount_competitor.createOrReplaceTempView('df_weekly_discount_competitor')
+# display(df_weekly_discount_competitor)
+# duplicates_df = spark.sql("""
+#     SELECT
+#         week_number,
+#         region_name,
+#         model_name,
+#         COUNT(*) AS c1
+#     FROM df_weekly_discount_competitor
+#     GROUP BY week_number, region_name,model_name
+#     HAVING COUNT(*) > 1
+# """)
+
+# if duplicates_df.count() > 0:
+#     raise ValueError("Duplicate entries found for week_number, region_name, and material_group_name in df_weekly_discount_competitor.")
+file_path = '/Workspace/Users/811879@lulumea.com/pricing_laundry/promo.csv'
+
+df_promo_events_raw = pd.read_csv(file_path)
+df_promo_events = df_promo_events_raw.copy()
+
+df_promo_events['start_date'] = pd.to_datetime(df_promo_events['start_date'], format='%d-%m-%Y')
+df_promo_events['end_date'] = pd.to_datetime(df_promo_events['end_date'], format='%d-%m-%Y')
+df_promo_events['event_date'] = df_promo_events.apply(lambda row: pd.date_range(row['start_date'], row['end_date']), axis=1)
+
+
+df_promo_events_exploded = df_promo_events.explode('event_date')
+df_promo_events_final = df_promo_events_exploded[['event_date', 'event_theme']].rename(columns={'event_theme': 'active_event_theme'})
+df_promo_events_final['week_number'] = df_promo_events_final['event_date'].dt.strftime('%Y-W%V')
+df_promo_events_final['event_date'] = df_promo_events_final['event_date'].dt.strftime('%Y-%m-%d')
+
+
+sdf_promo_events_final = spark.createDataFrame(df_promo_events_final)
+sdf_promo_events_final.createOrReplaceTempView('promo_events_final_view')
+
+
+query_event_index = """
+WITH weekly_event_days AS (
+    SELECT 
+        week_number,
+        COUNT(DISTINCT active_event_theme) AS num_events,
+        SUM(num_days) AS total_event_days,
+        MAX(num_days) AS max_event_duration
+    FROM
+    (
+        SELECT
+            week_number,
+            active_event_theme,
+            COUNT(DISTINCT event_date) AS num_days
+        FROM promo_events_final_view
+        GROUP BY week_number, active_event_theme
+    )
+    Group by week_number
+),
+
+events_on_weekend AS (
+    SELECT
+        week_number,
+        count(distinct active_event_theme) as num_promo_events_on_weekend
+    FROM (
+        SELECT
+            week_number,
+            active_event_theme,
+            event_date,
+            dayofweek(TO_DATE(event_date, 'yyyy-MM-dd')) AS day_of_week
+        FROM promo_events_final_view
+    )
+    WHERE day_of_week IN (6, 7)  -- Saturday (6) and Sunday (7)
+    GROUP BY week_number
+)
+
+Select 
+    we.week_number,
+    we.num_events,
+    we.total_event_days,
+    we.max_event_duration,
+    eow.num_promo_events_on_weekend
+from weekly_event_days we
+left join events_on_weekend eow ON we.week_number = eow.week_number
+
+"""
+
+df_event_index = spark.sql(query_event_index)
+df_event_index.createOrReplaceTempView('promo_event_index_week_view')
+df_event_index.display()
+%md
+**_Dont run multiple times the weather data. API calls might expire_**
+!pip install openmeteo-requests
+!pip install requests-cache retry-requests numpy pandas
+import openmeteo_requests
+import pandas as pd
+import numpy as np
+import requests_cache
+from retry_requests import retry
+
+# Setup the Open-Meteo API client
+cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
+retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+openmeteo = openmeteo_requests.Client(session=retry_session)
+
+# UAE cities and their coordinates
+cities = {
+    "Abu Dhabi": (24.4539, 54.3773),
+    "Dubai": (25.276987, 55.296249),
+    "Sharjah": (25.3463, 55.4209),
+    "Al Ain": (24.1302, 55.8023)
+}
+
+# Common API parameters
+base_params = {
+    "start_date": "2022-10-02",
+    "end_date": "2025-10-29",
+    "hourly": ["temperature_2m", "rain"]
+}
+
+# Store data for all cities
+all_data = []
+
+for city, (lat, lon) in cities.items():
+    print(f"Fetching data for {city}...")
+    params = base_params.copy()
+    params.update({"latitude": lat, "longitude": lon})
+
+    # API Call
+    responses = openmeteo.weather_api("https://archive-api.open-meteo.com/v1/archive", params=params)
+    response = responses[0]
+    
+    hourly = response.Hourly()
+    temperature = hourly.Variables(0).ValuesAsNumpy()
+    rain = hourly.Variables(1).ValuesAsNumpy()
+    
+    timestamps = pd.date_range(
+        start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
+        inclusive="left"
+    )
+
+    df = pd.DataFrame({
+        "datetime": timestamps,
+        "temperature_2m": temperature,
+        "rain": rain
+    })
+    df["city"] = city
+    df["date"] = df["datetime"].dt.date
+    df["week"] = df["datetime"].dt.to_period("W").apply(lambda r: r.start_time.strftime('%Y-W%W'))
+    df["month"] = df["datetime"].dt.to_period("M").apply(lambda r: r.start_time.strftime('%Y-M%m'))
+
+    all_data.append(df)
+
+# Combine data from all cities
+df_all = pd.concat(all_data)
+
+# Aggregations
+daily_agg = df_all.groupby(["city", "date"]).agg(
+    max_temperature=("temperature_2m", "max"),
+    total_rainfall=("rain", "sum")
+).reset_index()
+
+# Weekly and Monthly dataframes creation
+weekly_agg = df_all.copy()
+monthly_agg = df_all.copy()
+
+weekly_agg = weekly_agg.groupby(["city", "week"]).agg(
+    max_temperature=("temperature_2m", "max"),
+    #round(max('temperature_2m'),2).alias("max_temperature"),
+    total_rainfall=("rain", "sum")
+).reset_index()
+
+monthly_agg = df_all.groupby(["city", "month"]).agg(
+    max_temperature=("temperature_2m", "max"),
+    #round(max('temperature_2m'),2).alias("max_temperature"),
+    total_rainfall=("rain", "sum")
+).reset_index()
+
+
+
+# Convert 'city' column to uppercase
+weekly_agg['city'] = weekly_agg['city'].str.upper()
+monthly_agg['city'] = monthly_agg['city'].str.upper()
+
+# Rename columns
+weekly_agg = weekly_agg.rename(columns={'week': 'week_number'})
+monthly_agg = monthly_agg.rename(columns={'month': 'month_number'})
+weekly_agg = weekly_agg.rename(columns={'city': 'region_name'})
+monthly_agg = monthly_agg.rename(columns={'city': 'region_name'})
+
+# Display samples
+# print("\nDaily:\n", daily_agg.head())
+print("\nWeekly:\n", weekly_agg.head())
+print("\nMonthly:\n", monthly_agg.head())
+# 1. Create Spark DataFrame from Pandas DataFrame (assuming weekly_agg is a Pandas DataFrame)
+weather_weekly = spark.createDataFrame(weekly_agg).distinct()
+
+# 2. Write out the result as a Hive table (in dev.sandbox database)
+weather_weekly.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{weekly_weather_data}")
+print(f'{weekly_weather_data}')
+spark.sql(f"""
+select 
+*
+from {weekly_weather_data}
+          
+""").display()
+duplicates_df = spark.sql(f"""
+    SELECT
+        week_number,
+        region_name,
+        COUNT(*) AS c1
+    FROM {weekly_weather_data}
+    GROUP BY week_number, region_name
+    HAVING COUNT(*) > 1
+""")
+
+if duplicates_df.count() > 0:
+    raise ValueError(f"Duplicate entries found for (week_number, region_name, material_group_name) in {weekly_weather_data}.")
+# spark.catalog.clearCache()
+# moving_avg_week_query = f"""
+# with ma_added_week_sales as (
+# select 
+# ean,
+# material_id,
+# region_name,
+# week_number,
+# sales,
+# quantity,
+# round(avg(quantity) over(partition by ean, material_id, region_name order by week_number rows between 2 preceding and 1 preceding), 3) as ma_2w_qty_new,
+# round(avg(quantity) over(partition by ean, material_id, region_name order by week_number rows between 4 preceding and 1 preceding), 3) as ma_4w_qty_new,
+# round(avg(sales) over(partition by ean, material_id, region_name order by week_number rows between 2 preceding and 1 preceding), 3) as ma_2w_sales_new,
+# round(avg(sales) over(partition by ean, material_id, region_name order by week_number rows between 4 preceding and 1 preceding), 3) as ma_4w_sales_new,
+# coalesce(round((ma_2w_sales_new - ma_4w_sales_new) / ma_4w_sales_new, 3), 1.0) as demand_trend,
+# round(ma_4w_sales_new / ma_4w_qty_new, 2) as avg_unit_price_ma_4w,
+# round(ma_2w_sales_new / ma_2w_qty_new, 2) as avg_unit_price_ma_2w,
+# round((sales/quantity) / (ma_4w_sales_new / ma_4w_qty_new), 2) as price_ration_ma_4w_derived,
+# round((sales/quantity)/ (ma_2w_sales_new / ma_2w_qty_new), 2) as price_ration_ma_2w_derived
+# from {mds_material_week_region_intermediate}
+# )
+
+# select * from ma_added_week_sales
+# """
+
+# moving_average_week_query = spark.sql(moving_avg_week_query)
+
+# moving_average_week_query.createOrReplaceTempView('moving_average_weekly')
+# moving_average_week_query.write \
+#     .mode("overwrite") \
+#     .option("overwriteSchema", "true") \
+#     .saveAsTable(f"{moving_average}")
+
+# display(moving_average_week_query)
+# Overall = (PL + National)
+
+df_overall_mg_sales = spark.sql(f"""
+with cte as 
+(
+    select 
+        sm.region_name,
+        mm.material_group_name, 
+        week_label as week_number, 
+        ROUND(sum(pos.amount),2) as overall_mg_sales,
+        sum(pos.quantity) as overall_mg_quantity
+    
+    from gold.transaction.uae_pos_transactions pos 
+    join gold.store.store_master sm on sm.store_id = pos.store_id 
+    join gold.material.material_master mm on pos.product_id = mm.material_id
+    join calendar c on c.date = pos.business_day
+    
+    where business_day between cast('{END_DATE}' as date) - interval 3 year and cast('{END_DATE}' as date)
+    and amount > 0 
+    and pos.quantity >0
+    and bulk_sale_flag is null
+    and upper(pos.transaction_type) in ('SALE','SELL_MEDIA')
+    -- and mm.material_group_name = 'TEA BAG'
+    and mm.material_group_name in (select distinct material_group_name from region_weekly_sales_info)
+    group by sm.region_name,mm.material_group_name, week_label
+)
+
+
+select * from cte 
+""")
+df_overall_mg_sales.createOrReplaceTempView('overall_mg_wk_sales')
+df_overall_mg_sales.display()
+
+df_seasonality = spark.sql(f"""
+with cte as 
+(
+    select 
+        sm.region_name,
+        mm.material_group_name, 
+        week_label as week_number, 
+        ROUND(sum(pos.amount),2) as sales,
+        sum(pos.quantity) as quantity
+    
+    from gold.transaction.uae_pos_transactions pos 
+    join gold.store.store_master sm  on sm.store_id = pos.store_id
+    join gold.material.material_master mm on pos.product_id = mm.material_id
+    join calendar c on c.date = pos.business_day
+    
+    where business_day between cast('{END_DATE}' as date) - interval 3 year and cast('{END_DATE}' as date)
+    and amount > 0 
+    and pos.quantity >0
+    and bulk_sale_flag is null
+    -- and mm.material_group_name = 'TEA BAG'
+    and upper(pos.transaction_type) in ('SALE','SELL_MEDIA')
+    and mm.material_group_name in (select distinct material_group_name from region_weekly_sales_info)
+    group by sm.region_name,mm.material_group_name, week_label
+)
+
+
+select * from cte 
+""").toPandas()
+def get_dg_seasonality_idx(df_final_mds_base):
+
+    import pandas as pd
+    import numpy as np
+
+    df_final_mds_base['year'] = df_final_mds_base['week_number'].str[:4]
+    df_final_mds_base['week_number_val'] = df_final_mds_base['week_number'].str[-3:]
+
+    # Include region in pivot index
+    df_seasonality_idx = df_final_mds_base.pivot_table(
+        index=['material_group_name', 'region_name', 'week_number_val'],
+        columns='year',
+        values='quantity'
+    )
+
+    df_seasonality_idx.columns = [f'year_{str(col)[-2:]}' for col in df_seasonality_idx.columns]
+    df_seasonality_idx.reset_index(inplace=True)
+
+    year_columns = [col for col in df_seasonality_idx.columns if col.startswith('year_')]
+
+    def calculate_overall_avg(group):
+        all_values = group[year_columns].values.flatten()
+        all_values = all_values[~np.isnan(all_values)]
+        return np.mean(all_values) if len(all_values) > 0 else np.nan
+
+    # Group by material and region_name
+    overall_avg = df_seasonality_idx.groupby(['material_group_name', 'region_name']).apply(calculate_overall_avg)
+
+    # Map overall average to each row
+    df_seasonality_idx['overall_avg_qty'] = df_seasonality_idx.set_index(['material_group_name', 'region_name']).index.map(overall_avg)
+
+    df_seasonality_idx['yearly_avg_qty'] = df_seasonality_idx[year_columns].mean(axis=1, skipna=True)
+
+    df_seasonality_idx['seasonality_idx'] = np.round(
+        df_seasonality_idx['yearly_avg_qty'] / df_seasonality_idx['overall_avg_qty'], 3
+    )
+
+    # Final output: include region_name
+    final_cols = ['material_group_name', 'week_number_val', 'region_name', 'seasonality_idx']
+    df_seasonality_idx_final = df_seasonality_idx[final_cols].copy()
+
+    return df_seasonality_idx_final
+
+    
+df_seasonality_idx = get_dg_seasonality_idx(df_final_mds_base=df_seasonality)
+
+seasonality_idx_mg = spark.createDataFrame(df_seasonality_idx); 
+seasonality_idx_mg.createOrReplaceTempView('week_reg_mg_seasonality_idx')
+display(seasonality_idx_mg)
+# # Step 1: Sort by material_id and week_number
+# lag_quantity_week=df_joined_cleaned if isinstance(df_joined_cleaned, pd.DataFrame) else df_joined_cleaned.toPandas()
+# lag_quantity_week = lag_quantity_week.sort_values(by=['ean','material_id', 'region_name', 'week_number']).reset_index(drop=True)
+
+# # Step 2: Create lag features (1-week and 2-week)
+# lag_quantity_week['lag_quantity_1w'] = lag_quantity_week['quantity'].shift(1)
+# lag_quantity_week['lag_quantity_2w'] = lag_quantity_week['quantity'].shift(2)
+# lag_quantity_week['lag_quantity_3w'] = lag_quantity_week['quantity'].shift(3)
+# # # Need to re-check on this - to replace null with 0 or not
+# # lag_quantity_week['lag_quantity_1w'].fillna(lag_quantity_week['lag_quantity_1w'].mean(), inplace=True)
+# # lag_quantity_week['lag_quantity_2w'].fillna(lag_quantity_week['lag_quantity_2w'].mean(), inplace=True)
+
+# # Step 3: Calculate delta and ratio
+# lag_quantity_week['lag_qty_delta'] = lag_quantity_week['lag_quantity_1w'] - lag_quantity_week['lag_quantity_2w']
+# lag_quantity_week['lag_qty_ratio'] = lag_quantity_week['lag_quantity_1w'] / (lag_quantity_week['lag_quantity_2w'] + 1e-6)  # avoid divide-by-zero
+
+# # Step 4: Round for clean output (optional)
+# lag_quantity_week[['lag_qty_delta', 'lag_qty_ratio']] = lag_quantity_week[['lag_qty_delta', 'lag_qty_ratio']].round(2)
+
+# # Step 5: creating the trend flag
+# def classify_trend(delta):
+#     if pd.isna(delta):
+#         return None
+#     elif delta > 0:
+#         return 'Rising'
+#     elif delta < 0:
+#         return 'Falling'
+#     else:
+#         return 'Stable'
+# lag_quantity_week['trend'] = lag_quantity_week['lag_qty_delta'].apply(classify_trend)
+
+# # Step 6: Select only relevant columns
+# lag_quantity_week1 = lag_quantity_week[['ean','material_id', 'region_name','week_number', 'quantity', 'lag_quantity_1w', 'lag_quantity_2w','lag_qty_delta','lag_qty_ratio','trend','lag_quantity_3w']]
+
+# spark_df_lag_quantity_week = spark.createDataFrame(lag_quantity_week1); 
+# spark_df_lag_quantity_week.createOrReplaceTempView('lag_quantity_week')
+# display(spark_df_lag_quantity_week)
+import pandas as pd
+import numpy as np
+
+query_numeric_dist = f"""
+    with  mat_reg_week_store_count AS (
+    select 
+    mm.material_group_name,
+    CONCAT(YEAR(b.business_day), '-W', LPAD(weekofyear(b.business_day), 2, '0')) as week_number,
+    region_name,
+    count(distinct b.store_id) as mat_reg_week_stores_count
+    from gold.transaction.uae_pos_transactions  b
+    join gold.material.material_master mm
+    on b.product_id = mm.material_id
+    --and mm.material_group_name in (select distinct material_group_name from {Base_table})
+    join gold.store.store_master sm 
+    on sm.store_id = b.store_id
+    where b.business_day between '{START_DATE}' and '{END_DATE}'
+        AND mm.material_group_name = '{selected_mg}'
+    group by region_name, 2, mm.material_group_name
+    ),
+
+    reg_week_store_count AS (
+    select 
+    model_name,
+    region_name,
+    material_group_name,
+    week_number,
+    count(distinct store_id) as tot_store_count
+    from {txn_data_raw_dg_poc_name}
+    where material_group_name = '{selected_mg}'
+    group by model_name,region_name, week_number,material_group_name
+    )
+
+    select
+    rw.*,
+    mrw.mat_reg_week_stores_count,
+    round(coalesce(rw.tot_store_count/mrw.mat_reg_week_stores_count,0),2) as num_distr_ratio
+    from reg_week_store_count rw
+    left join mat_reg_week_store_count mrw
+    ON mrw.region_name = rw.region_name and mrw.week_number = rw.week_number
+    and mrw.material_group_name = rw.material_group_name
+"""
+    
+numeric_dist_week = spark.sql(query_numeric_dist)
+#pdf_numeric_dist = sdf_numeric_dist.toPandas()
+
+numeric_dist_week.createOrReplaceTempView('numeric_dist_week')
+numeric_dist_week.display()
+pay_day_cal_code = f"""
+
+-- Step 1: Assign pay-day bucket and index per day
+WITH base_with_calendar AS (
+    select 
+        region_name,
+        business_day,
+        week_number,
+        day_month as day_of_month,
+        model_name,
+        round(sum(amount)) as sales,
+        sum(quantity) as quantity,
+        round(sum(amount)/sum(quantity),2) as unit_price_derived,
+        CASE
+            WHEN day_of_month BETWEEN 1 AND 5  THEN 'Pay-day Spike'
+            WHEN day_of_month BETWEEN 6 AND 10 THEN 'Month Above Avg'
+            WHEN day_of_month BETWEEN 11 AND 25 THEN 'Mid-month Below Avg'
+            WHEN day_of_month BETWEEN 26 AND 31 THEN 'Month Above Avg'
+        END AS pay_day_bucket
+    from {txn_data_raw_dg_poc_name}
+    where material_group_name = '{selected_mg}'
+    group by 
+        region_name,
+        business_day,
+        week_number,
+        day_month,
+        model_name
+),
+
+-- Step 2: Overall avg sales per model-region (daily level)
+overall_avg AS (
+    SELECT 
+        model_name,
+        region_name,
+        AVG(sales) AS avg_daily_sales
+    FROM base_with_calendar
+    GROUP BY model_name, region_name
+),
+
+-- Step 3: Dynamic bucket indices per product-region
+bucket_index_calc AS (
+    SELECT
+        d.model_name,
+        d.region_name,
+        d.pay_day_bucket,
+        round(AVG(d.sales) / AVG(o.avg_daily_sales),2) AS bucket_index
+    FROM base_with_calendar d
+    JOIN overall_avg o ON d.model_name = o.model_name AND d.region_name = o.region_name
+    GROUP BY 
+        d.model_name, 
+        d.region_name, 
+        d.pay_day_bucket
+),
+
+-- Step 4: Attach dynamic bucket index back to each daily record
+model_region_week_index AS (
+  SELECT
+    d.model_name,
+    d.region_name,
+    d.week_number,
+    ROUND(avg(b.bucket_index),3) as pay_day_index
+  FROM base_with_calendar d
+  JOIN bucket_index_calc b
+    ON d.pay_day_bucket = b.pay_day_bucket
+      AND d.model_name = b.model_name
+      AND d.region_name = b.region_name
+    GROUP BY d.model_name,
+        d.region_name,
+        d.week_number
+)
+
+select 
+  *
+from model_region_week_index
+
+"""
+
+pay_day_cal = spark.sql(pay_day_cal_code)
+pay_day_cal.createOrReplaceTempView('week_reg_pay_day_index')
+display(pay_day_cal)
+# vert_hor_promo_code = f"""
+# WITH pos_data AS (
+#   select 
+#     txn.material_id,
+#     txn.ean,
+#     txn.material_name,
+#     txn.material_group_name,
+#     txn.category_name,
+#     txn.region_name,
+#     txn.business_day,
+#     txn.week_number,
+#     txn.transaction_id,
+#     em.unit,
+#     round(sum(amount),1) as sales,
+#     sum(quantity) as quantity,
+#     round(sum(amount)/sum(quantity),1) as unit_price_derived,
+#     round(avg(unit_price),1) as unit_price,
+#     round(avg(actual_unit_price),1) as actual_unit_price,
+#     case when em.unit = 'ZU' then 1 else 0 end as clearance_sale
+#   from {txn_data_raw_dg_poc_name} as txn
+#   left join gold.material.material_ean_master as em
+#      ON txn.material_id = em.material_id
+#       AND txn.ean = em.ean AND em.unit != 'ZU'
+#   group by 
+#     txn.material_id,
+#     txn.ean,
+#     txn.material_name,
+#     txn.material_group_name,
+#     txn.category_name,
+#     txn.region_name,
+#     txn.business_day,
+#     txn.week_number,
+#     txn.transaction_id,
+#     em.unit
+# ),
+
+
+# vertical_discount AS (
+#     SELECT
+#         business_day,
+#         week_number,
+#         transaction_id,
+#         material_id,
+#         ean,
+#         material_group_name,
+#         category_name,
+#         region_name,
+#         sales,
+#         quantity,
+#         unit_price,
+#         actual_unit_price,
+
+#         -- Vertical promo (row level)
+#         CASE WHEN actual_unit_price < unit_price
+#              THEN 1 ELSE 0 END AS vertical_promo_flag,
+
+#         CASE WHEN actual_unit_price < unit_price
+#              THEN ROUND((unit_price - actual_unit_price) / unit_price*100,2)
+#              ELSE 0 END AS vertical_discount_pct
+#     FROM pos_data
+# ),
+
+# -- Step 1: Structural Price Change (SKU-level)
+# structural AS (
+#     SELECT
+#         b.*,
+#         CASE WHEN unit_price < LAG(unit_price) OVER (
+#                       PARTITION BY material_id, region_name
+#                       ORDER BY business_day)
+#              THEN 1 ELSE 0 END AS structural_change_flag,
+
+#         CASE WHEN unit_price < LAG(unit_price) OVER (
+#                       PARTITION BY material_id, region_name
+#                       ORDER BY business_day)
+#              THEN ROUND((LAG(unit_price) OVER (
+#                            PARTITION BY material_id, region_name
+#                            ORDER BY business_day) - unit_price) /
+#                          LAG(unit_price) OVER (
+#                            PARTITION BY material_id, region_name
+#                            ORDER BY business_day)*100, 2)
+#              ELSE 0 END AS reset_pct
+#     FROM vertical_discount b
+# ),
+
+# -- Step 2: Days since structural reset
+# structural_with_days AS (
+#     SELECT
+#         s.*,
+#         SUM(CASE WHEN structural_change_flag = 1 THEN 1 ELSE 0 END)
+#             OVER (PARTITION BY material_id, region_name
+#                   ORDER BY business_day
+#                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS reset_counter
+#     FROM structural s
+# ),
+# structural_days AS (
+#     SELECT
+#         *,
+#         ROW_NUMBER() OVER (PARTITION BY material_id, region_name, reset_counter
+#                            ORDER BY business_day) - 1 AS days_since_reset
+#     FROM structural_with_days
+# ),
+
+# -- Step 3: Transaction-level Horizontal Promo
+# txn_summary AS (
+#     SELECT
+#         business_day,
+#         region_name,
+#         transaction_id,
+#         COUNT(CASE WHEN vertical_promo_flag = 1 THEN 1 END) AS num_disc_skus_in_txn,
+#         COUNT(DISTINCT CONCAT(material_id,ean)) as tot_skus_txn,
+#         ROUND(AVG(CASE WHEN vertical_promo_flag = 1 THEN vertical_discount_pct END),2) AS avg_disc_pct_txn,
+#         ROUND(SUM(vertical_discount_pct * sales) / NULLIF(SUM(CASE WHEN vertical_promo_flag = 1 THEN sales END),0),2)
+#             AS wtd_disc_pct_txn
+#     FROM structural_days
+#     GROUP BY business_day, region_name, transaction_id
+# ),
+
+# -- Step 4: Join back transaction-level horizontal signals
+# final_with_txn AS (
+#     SELECT
+#         sd.*,
+#         CASE WHEN ts.num_disc_skus_in_txn >= 2 THEN 1 ELSE 0 END AS horizontal_promo_txn_flag,
+#         COALESCE(ts.num_disc_skus_in_txn,0) AS num_disc_skus_in_txn,
+#         COALESCE(ts.tot_skus_txn,0) AS tot_skus_txn,
+#         COALESCE(ts.avg_disc_pct_txn,0) AS avg_horizontal_disc_txn,
+#         COALESCE(ts.wtd_disc_pct_txn,0) AS wtd_horizontal_disc_txn
+#     FROM structural_days sd
+#     LEFT JOIN txn_summary ts
+#       ON sd.business_day = ts.business_day
+#      AND sd.region_name = ts.region_name
+#      AND sd.transaction_id = ts.transaction_id
+# )
+
+# -- Final output at row level (can later aggregate to SKU × Store × Day)
+# SELECT *
+# FROM final_with_txn
+# """
+
+# vert_hor_promo = spark.sql(vert_hor_promo_code)
+# vert_hor_promo.createOrReplaceTempView("vert_hor_promo_temp")
+# display(vert_hor_promo)
+
+# # ORDER BY business_day, region_name, material_id, transaction_id;
+
+# vert_hor_promo_agg_code = f"""
+
+# WITH weekly_promo AS (
+#     SELECT
+#         week_number,
+#         material_id,
+#         ean,
+#         region_name,
+#         -- Aggregate promo features
+#         -- MAX(vertical_promo_flag) AS vertical_promo_flag
+#         ROUND(AVG(vertical_promo_flag),2) AS vertical_promo_flag_pct,        -- % of time in promo
+#         ROUND(AVG(vertical_discount_pct),2) AS vertical_promo_actual_pct,    -- avg depth of promo
+#         ROUND(AVG(num_disc_skus_in_txn),2) AS avg_num_disc_skus_in_txn,  -- avg co-promo basket size
+#         ROUND(AVG(avg_horizontal_disc_txn),2) AS horizontal_promo_actual_pct,              -- avg basket-level discount %
+#         ROUND(AVG(wtd_horizontal_disc_txn),2) AS horizontal_promo_actual_wtd_pct
+#     FROM vert_hor_promo_temp  -- <-- your earlier output table
+#     GROUP BY
+#         week_number,
+#         material_id,
+#         ean,
+#         region_name
+# )
+
+# SELECT 
+#     *
+# FROM weekly_promo
+# -- ORDER BY week_num, region_name, material_id;
+# """
+
+# vert_hor_promo_agg = spark.sql(vert_hor_promo_agg_code)
+# vert_hor_promo_agg.createOrReplaceTempView("vert_hor_promo_agg_temp")
+# display(vert_hor_promo_agg)
+
+
+final_mds_table = f"""
+with cte as 
+(
+select 
+  base.week_number,
+  base.model_name,
+  base.region_name,
+  base.material_group_name,
+  base.category_name,
+  round(coalesce(base.sales,0),2) as sales,
+  base.num_txns,
+  base.quantity,
+  base.avg_unit_price,
+  base.num_stores,
+  base.pay_days,
+  base.units,
+  base.total_volume,
+  round(coalesce(base.per_vol_price,0),5) as per_vol_price,
+  base.material_set,
+  base.has_holidays,
+  -- round(coalesce(wci.competitors,0),2) as competitors_count,
+  -- round(coalesce(wci.comp_per_vol_price,0),5) as comp_per_vol_price,
+  -- ROUND(coalesce(base.per_vol_price,0)/coalesce(wci.comp_per_vol_price,0),4) As comp_per_price_ratio,
+  cast(0 as bigint) as competitors_count,
+  cast(0 as double) as comp_per_vol_price,
+  cast(0 as double) as comp_per_price_ratio,
+  ROUND(COALESCE(wdi.total_discount,0),2) AS total_discount,
+  COALESCE(wdi.num_stores_discount,0) AS num_stores_discount,
+  CASE when promo_flag = 1 then 1 else 0 end as promo_flag,
+
+  -- round(coalesce(wdc.comp_total_discount,0),2) as comp_total_discount,
+  -- COALESCE(wdc.comp_disc_stores,0) AS comp_disc_stores,
+  cast(0 as double) as comp_total_discount,
+  cast(0 as bigint) as comp_disc_stores,
+  COALESCE(peiw.num_events,0) as num_promo_events, 
+  COALESCE(peiw.total_event_days,0) as total_event_days, 
+  COALESCE(peiw.max_event_duration,0) max_event_duration,
+  COALESCE(peiw.num_promo_events_on_weekend,0) num_promo_events_on_weekend,
+  ROUND(COALESCE(wwd.max_temperature,0),4) as max_temperature,
+  ROUND(COALESCE(wwd.total_rainfall,0),2) as total_rainfall,
+  round(coalesce(ms.seasonality_idx,0),3) seasonality_idx,
+  round(coalesce(ndw.num_distr_ratio,0),3) as num_distr_ratio,
+  round(coalesce(pdi.pay_day_index,0),3) as pay_day_index,
+
+ROUND(COALESCE(AVG(ms.seasonality_idx) 
+  OVER (PARTITION BY base.model_name, base.region_name ORDER BY base.week_numberROWS BETWEEN 3 PRECEDING AND 1 PRECEDING),
+  AVG(ms.seasonality_idx) OVER (PARTITION BY base.model_name, base.region_name)),2) AS seasonality_3w_ma,
+
+-- 4-week moving average excluding current row
+ROUND(
+  COALESCE(
+    AVG(ms.seasonality_idx) OVER (
+      PARTITION BY base.model_name, base.region_name
+      ORDER BY base.week_number
+      ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+    ),
+    AVG(ms.seasonality_idx) OVER (
+      PARTITION BY base.model_name, base.region_name
+    )
+  ),
+  2
+) AS seasonality_4w_ma,
+
+-- 2-week moving average excluding current row
+ROUND(
+  COALESCE(
+    AVG(ms.seasonality_idx) OVER (
+      PARTITION BY base.model_name, base.region_name
+      ORDER BY base.week_number
+      ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ),
+    AVG(ms.seasonality_idx) OVER (
+      PARTITION BY base.model_name, base.region_name
+    )
+  ),
+  2
+) AS seasonality_2w_ma
+,
+  round(COALESCE(total_discount/(total_discount+base.sales),0),2) as total_discount_ratio,
+  round(COALESCE(num_stores_discount/(num_stores_discount+num_stores),0),2) as stores_on_discount_ratio,
+CASE 
+  WHEN base.week_number IN ('2023-W10','2023-W11', '2023-W12', '2023-W13', '2023-W14', '2023-W15','2023-W16','2024-W09', '2024-W10', '2024-W11', '2024-W12', '2024-W13', '2024-W14', '2024-W15','2025-W07', '2025-W08', '2025-W09', '2025-W10', '2025-W11','2025-W12', '2025-W13') 
+  THEN 1 
+  ELSE 0 
+END AS is_ramadan_flag,
+round(coalesce(oms.overall_mg_sales,0),1) as overall_mg_sales,
+round(coalesce(base.sales,0)/coalesce(oms.overall_mg_sales,0)*100,2) as sales_contr_perc_mg_overall,
+oms.overall_mg_quantity as overall_mg_quantity
+
+from region_weekly_sales_info as base
+-- LEFT JOIN weekly_competitors_info as wci
+--     ON base.week_number = wci.week_number 
+--     and base.model_name = wci.model_name 
+--     and base.region_name = wci.region_name
+LEFT JOIN region_weekly_discount_info as wdi
+    ON base.week_number = wdi.week_number 
+    and base.model_name = wdi.model_name 
+    and base.region_name = wdi.region_name
+-- LEFT JOIN df_weekly_discount_competitor as wdc
+--     ON base.week_number = wdc.week_number 
+--     and base.model_name = wdc.model_name 
+--     and base.region_name = wdc.region_name
+LEFT JOIN promo_event_index_week_view as peiw
+    ON base.week_number = peiw.week_number 
+LEFT JOIN {weekly_weather_data} as wwd
+    ON base.week_number = wwd.week_number 
+    and base.region_name = wwd.region_name
+left join week_reg_mg_seasonality_idx as ms
+    on ms.material_group_name = base.material_group_name 
+    and right(base.week_number,3) = ms.week_number_val 
+    and base.region_name = ms.region_name
+left join numeric_dist_week as ndw
+    on base.model_name = ndw.model_name 
+    and base.week_number = ndw.week_number 
+    and base.region_name = ndw.region_name
+left join week_reg_pay_day_index pdi
+    ON base.model_name = pdi.model_name 
+    and base.week_number = pdi.week_number 
+    and base.region_name = pdi.region_name
+LEFT JOIN overall_mg_wk_sales as oms
+    ON base.week_number = oms.week_number 
+    and base.material_group_name = oms.material_group_name
+    and base.region_name = oms.region_name
+)
+
+SELECT *,
+  round(COALESCE(
+    LAG(comp_total_discount) OVER (
+      PARTITION BY model_name, region_name ORDER BY week_number
+    ),
+    AVG(comp_total_discount) OVER (
+      PARTITION BY model_name, region_name
+    )
+  ),2) AS lag_competition_discount,
+  round(COALESCE(LAG(total_discount) OVER (
+           PARTITION BY model_name, region_name -- adjust based on your grain
+           ORDER BY week_number 
+         ),0),2) AS lagged_total_discount,
+
+  round(COALESCE(
+    LAG(num_promo_events) OVER (
+      PARTITION BY model_name, region_name ORDER BY week_number
+    ),
+    AVG(num_promo_events) OVER (
+      PARTITION BY model_name, region_name
+    ),0)
+  ,2) AS lag_num_promo_events
+
+FROM cte
+
+"""
+
+final_mds = spark.sql(final_mds_table)
+final_mds.write.mode("append").option('overwriteSchema','True').saveAsTable(mds_material_week_region)
+display(final_mds)
+%sql
+select 
+  *
+from dev.sandbox.sd_pl_mds_weekly_mg
+%sql
+select 
+  model_name,
+  week_number,
+  region_name
+from dev.sandbox.sd_pl_mds_weekly_mg
+GROUP BY 
+  model_name,
+  week_number,
+  region_name
+HAVING COUNT(*) > 1
+%sql
+select 
+  *
+from dev.sandbox.sd_pl_mds_weekly_mg
+where material_group_name = 'SUGAR&CHOCO CEREALS'
+-- and model_name = 'TOM & JERRY CHOCO BITS 375G'
+and model_name = 'TOM &JERRY CHOCO FLAIR 375G'
+from pyspark.sql import functions as F
+from itertools import combinations_with_replacement
+import pandas as pd
+
+pdf = spark.sql(f"select * except(avg_unit_price) from dev.sandbox.sd_mds_weekly_{set}").toPandas()
+# pdf = your pandas DataFrame
+
+# capturing the numeric columns from the MDS
+num_cols = [col for col in pdf.columns if pdf[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+
+corr_mat = pdf[num_cols].corr()  # pairwise correlation
+
+# Reset index to get 'var1'
+corr_df = corr_mat.reset_index().melt(id_vars='index', var_name='var2', value_name='corr')
+corr_df.rename(columns={'index': 'var1'}, inplace=True)
+corr_df['corr'] = corr_df['corr'].round(3)
+# corr_df.display()
+
+corr_spark_df = spark.createDataFrame(corr_df)
+corr_matrix = corr_spark_df.groupBy("var1").pivot("var2").agg(F.first("corr"))
+display(corr_matrix)
+
+# corr_matrix.toPandas().to_csv("/Workspace/Users/811991@lulumea.com/Exported Files/pl_pricing_setc_corr_matrix.csv", index=False)
+
+from pyspark.sql import functions as F
+from itertools import combinations_with_replacement
+import pandas as pd
+
+pdf = spark.sql(f"select * except(avg_unit_price,sales,quantity,num_txns,competitors_count) from dev.sandbox.sd_mds_weekly_{set}").toPandas()
+# pdf = your pandas DataFrame
+
+# capturing the numeric columns from the MDS
+num_cols = [col for col in pdf.columns if pdf[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+
+corr_mat = pdf[num_cols].corr()  # pairwise correlation
+
+# Reset index to get 'var1'
+corr_df = corr_mat.reset_index().melt(id_vars='index', var_name='var2', value_name='corr')
+corr_df.rename(columns={'index': 'var1'}, inplace=True)
+corr_df['corr'] = corr_df['corr'].round(3)
+# corr_df.display()
+
+corr_spark_df = spark.createDataFrame(corr_df)
+corr_matrix = corr_spark_df.groupBy("var1").pivot("var2").agg(F.first("corr"))
+display(corr_matrix)
+
+# corr_matrix.toPandas().to_csv("/Workspace/Users/811991@lulumea.com/Exported Files/pl_pricing_setc_corr_matrix.csv", index=False)
+
+import pandas as pd
+
+# Example MDS DataFrame (replace with your actual data)
+pdf = spark.sql(f"select * from dev.sandbox.sd_mds_weekly_{set}").toPandas()
+
+# Columns to group by (SKU + region identifiers)
+group_cols = ['region_name','material_id','ean','material_name','material_group_name','category_name']
+
+# Numeric columns to correlate with quantity
+# numeric_cols = ['unit_price_derived','sales','total_discount','seasonality_2w_ma']  # add all other numeric features here
+
+numeric_cols = ['sales', 'pay_days', 'txns', 'unit_price_derived', 'avg_regular_unit_price', 'avg_actual_unit_price', 'num_stores_sold', 'has_holidays', 'total_discount', 'stores_on_discount', 'brand_competitor_quantity', 'brand_competitor_sales', 'brand_competitor_unit_price', 'brand_competitors_count', 'brand_competitors_total_discount', 'brand_competitors_stores_discount', 'num_promo_events', 'total_promo_event_days', 'max_promo_event_duration', 'num_promo_events_on_weekend', 'brand_competitors_price_ratio', 'max_temperature', 'total_rainfall', 'MA_4W_SALES', 'MA_2W_QTY', 'avg_unit_price_derived_ma_2W', 'MA_4W_QTY', 'avg_unit_price_ma_4w', 'ma_2w_sales', 'price_ratio_ma_4w_derived', 'price_ratio_ma_2w_derived', 'demand_trend', 'seasonality_idx', 'seasonality_mg_idx', 'lag_quantity_1w', 'lag_quantity_2w', 'lag_quantity_3w', 'lag_qty_delta', 'lag_qty_ratio', 'material_presence_in_stores', 'lag_competitors_brand_price_ratio', 'total_stores_mg_region', 'seasonality_3w_ma', 'seasonality_4w_ma', 'seasonality_2w_ma', 'num_distr_ratio', 'total_discount_ratio', 'stores_on_discount_ratio', 'is_2024_ramadan', 'is_2025_ramadan', 'pay_day_index', 'vertical_promo_flag_pct', 'vertical_promo_actual_pct', 'avg_num_disc_skus_in_txn', 'horizontal_promo_actual_pct', 'horizontal_promo_actual_wtd_pct', 'item_count', 'total_volume_gen', 'unit_price_der_per_vol', 'actual_unit_price_per_vol', 'competitor_unit_price_per_vol', 'lag_competition_discount', 'lagged_total_discount', 'lag_promo']
+
+target_col = 'quantity'
+
+# Result list
+rows = []
+
+# Group by SKU + region
+for _, group in pdf.groupby(['material_id','ean','region_name']):
+    # Compute correlation of numeric columns vs quantity
+    corr = group[numeric_cols + [target_col]].corr()[target_col].drop(target_col).round(3)
+    # corr.rename(columns={'index': 'var1'}, inplace=True)
+    
+    # numeric_in_group = [c for c in numeric_cols if c in group.columns]
+    
+    # # Compute correlation only if there is more than 1 numeric column
+    # if len(numeric_in_group) >= 1:
+    #     corr = group[numeric_in_group + [target_col]].corr()[target_col].drop(target_col).round(3)
+    # else:
+    #     corr = pd.Series(dtype=float)
+
+    # For each row in the group, create output dict
+    for _, row in group.iterrows():
+        row_dict = {col: row[col] for col in group_cols}
+        # Add correlation values
+        for i, col in enumerate(corr.index, start=3):
+            # row_dict[f'Var{i}'] = corr[col]
+            row_dict[col] = corr[col]
+        rows.append(row_dict)
+
+# Convert to DataFrame
+corr_wide_df = pd.DataFrame(rows).drop_duplicates()
+
+# Display
+corr_wide_df.display()
+
+corr_wide_df.to_csv("/Workspace/Users/811991@lulumea.com/Exported Files/pl_pricing_setc_mds_corr.csv", index=False)
+
+
+# For any SKU in a given region, if the distinct unit_price_derived is 1, add 0.1 to a random record in the column
+import numpy as np
+
+# final_mds.toPandas()
+# Step 1: Group by material_id and region_name, and count unique values of unit_price_derived
+# temp = final_mds.groupby(['ean','material_name', 'region_name'])['unit_price_derived'].nunique().reset_index()
+
+temp = final_mds.groupBy("ean", "material_name", "region_name").agg(F.countDistinct("unit_price_derived").alias("unit_price_derived")).toPandas()
+# Step 2: Filter for pairs where the distinct count of unit_price_derived is 1
+temp = temp[temp['unit_price_derived'] == 1].reset_index(drop=True)
+
+# Step 3: Extract unique materials
+materials = temp['material_name'].unique()
+
+# Initialize a list to log the affected material-region pairs
+affected_pairs = []
+
+# # Step 4: Iterate through materials and their regions
+# for material in materials:
+#     # Get unique regions for the current material
+#     regions = temp[temp['material_name'] == material]['region_name'].unique()
+
+#     for region in regions:
+#         # Filter the DataFrame for the current material and region
+#         filtered_df = final_mds[(final_mds['material_name'] == material) & (final_mds['region_name'] == region)]
+
+#         # Randomly select one index
+#         random_index = np.random.choice(filtered_df.index)
+
+#         # Apply the 0.1 increment to unit_price_derived
+#         final_mds.loc[random_index, 'unit_price_derived'] += 0.1
+
+#         # Log the affected material-region pair
+#         affected_pairs.append((material, region))
+
+# # Step 5: Print the affected pairs
+# print("Material-Region pairs where 0.1 was added:")
+# for pair in affected_pairs:
+#     print(f"Material: {pair[0]}, Region: {pair[1]}")
+
+for _, row in temp.iterrows():
+    ean = row['ean']
+    material = row['material_name']
+    region = row['region_name']
+
+    # Select all rows for this EAN × Region
+    mask = (final_mds['ean'] == ean) & (final_mds['region_name'] == region)
+    filtered_df = final_mds[mask]
+
+    if filtered_df.count() > 0:
+        random_index = np.random.choice(filtered_df.toPandas().index)
+        final_mds.loc[random_index, 'unit_price_derived'] += 0.1
+        affected_pairs.append((ean, material, region))
+
+# Step 4: Print affected EAN-Region pairs
+print("EAN-Material-Region pairs where 0.1 was added:")
+for ean, material, region in affected_pairs:
+    print(f"EAN: {ean}, Material: {material}, Region: {region}")
+
+
+# # impute for those records where price_ratio_comp is null
+# final_mds['price_ratio_comp'] = final_mds.groupby(['material_id', 'region_name'])['price_ratio_comp'].transform(lambda x: x.fillna(x.mean()))
+
+
+# impute for those records where price_ratio_comp is null for all rows for a given material-region pair (no other item from same DG present)
+
+# final_mds['price_ratio_comp'].fillna(1, inplace=True)
+# spark_df = spark.createDataFrame(final_mds).write.mode("overwrite").option('overwriteSchema','True').saveAsTable(f"{mds_material_week_region}")
+from pyspark.sql import functions as F
+
+# Check for duplicate keys
+dup_keys = (
+    spark.table(f"{final_table}")
+    .groupBy("ean","material_id", "week", "region_name")
+    .count()
+    .filter("count > 1")
+    .limit(10)
+)
+
+# Collect duplicates
+duplicates = dup_keys.collect()
+
+# Raise error if duplicates are found
+if duplicates:
+    print(f"❌ Duplicate entries found for material_id, week, region_name:\n{duplicates}")
+else:
+    print("✅ No duplicates found for material_id, week, region_name.")
+spark.sql(f'SELECT * FROM dev.sandbox.sd_mds_weekly_{set}').display()
+%md
+# Model - Weekly - UAE
+spark.sql(f"""
+CREATE OR REPLACE TABLE {mds_material_week_uae} AS 
+WITH cte_raw AS (
+  SELECT
+    category_name,
+    material_group_name,
+    material_id,
+    week,
+    SUM(sales) AS sales,
+    SUM(quantity) AS quantity,
+    ROUND(SUM(sales) / NULLIF(SUM(quantity), 0)) AS unit_price_derived,
+    ROUND(SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0), 2) AS competitor_price,
+    ROUND(
+      (SUM(sales) / NULLIF(SUM(quantity), 0)) / NULLIF((SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0)), 0), 2
+    ) AS competitor_price_ratio,
+    SUM(total_discount) AS total_discount,
+    MAX(has_holidays) AS has_holidays,
+    AVG(avg_regular_unit_price) AS avg_regular_unit_price,
+    AVG(avg_actual_unit_price) AS avg_actual_unit_price,
+    ROUND(SUM(total_discount) / NULLIF((SUM(total_discount) + SUM(sales)), 0), 2) AS total_discount_ratio,
+    SUM(brand_competitors_total_discount) AS brand_competitors_total_discount,
+    AVG(seasonality_idx) AS seasonality_idx,
+    AVG(max_temperature) AS max_temperature,
+    AVG(total_rainfall) AS total_rainfall,
+    MAX(num_promo_events) AS num_promo_events,
+    MAX(total_promo_event_days) AS total_promo_event_days,
+    MAX(max_promo_event_duration) AS max_promo_event_duration,
+    MAX(num_promo_events_on_weekend) AS num_promo_events_on_weekend,
+    CASE 
+  WHEN week IN ('2024-W09', '2024-W10', '2024-W11', '2024-W12', '2024-W13', '2024-W14', '2024-W15') 
+  THEN 1 
+  ELSE 0 
+END AS is_2024_ramadan,
+
+CASE 
+  WHEN  week IN ('2025-W07', '2025-W08', '2025-W09', '2025-W10', '2025-W11','2025-W12', '2025-W13') 
+  THEN 1 
+  ELSE 0 
+END AS is_2025_ramadan
+  FROM {final_table}
+  GROUP BY category_name, material_group_name, material_id, week
+),
+
+cte AS (
+  SELECT *,
+    COALESCE(LAG(quantity, 1) OVER (PARTITION BY material_id ORDER BY week),avg(quantity) over(partition by material_id)) AS quantity_lag_1,
+    COALESCE(LAG(quantity, 2) OVER (PARTITION BY material_id ORDER BY week) ,avg(quantity) over(partition by material_id))
+    AS quantity_lag_2,
+    ROUND(
+      (LAG(quantity, 1) OVER (PARTITION BY material_id ORDER BY week) +
+       LAG(quantity, 2) OVER (PARTITION BY material_id ORDER BY week)) / 2.0, 2
+    ) AS quantity_ma_2w_excl_current,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_2w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_3w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_5w_ma,
+
+    -- Price moving averages --
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_id ORDER BY week 
+      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_2W,
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_id ORDER BY week 
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_4W,
+
+    -- Quantity vs price ratios --
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_id ORDER BY week ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_4w_derived,
+
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_id ORDER BY week ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_2w_derived,
+
+    -- Competitor price ratio re-used as-is from cte_raw
+    competitor_price_ratio AS brand_competitors_price_ratio
+  FROM cte_raw
+  WINDOW w AS (PARTITION BY material_id ORDER BY week)
+  
+),
+
+cte_with_imputation AS (
+  SELECT *,
+    COALESCE(
+      quantity_ma_2w_excl_current,
+      ROUND(AVG(quantity_ma_2w_excl_current) OVER (PARTITION BY material_id), 2)
+    ) AS quantity_ma_2w,
+    COALESCE(seasonality_2w_ma,avg(seasonality_idx) over (partition by material_id),2) as seasonality_2w,
+     COALESCE(seasonality_3w_ma,avg(seasonality_idx) over (partition by material_id),2)
+    as seasonality_3w,
+    COALESCE(seasonality_5w_ma,avg(seasonality_idx) over (partition by material_id),2)
+    as seasonality_5w
+  FROM cte
+),
+
+competitor AS (
+  SELECT 
+    CASE 
+      WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+      THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+      ELSE '2025-W01' 
+    END AS week_number,
+    mm.material_group_name,
+    COUNT(DISTINCT store_id) AS num_stores_sold,
+    COUNT(DISTINCT CASE WHEN NOT (brand ILIKE '%lulu%' OR brand ILIKE '%repacked%') THEN material_id END) AS competitors_count
+  FROM gold.material.material_master mm 
+  JOIN gold.transaction.uae_pos_transactions pos 
+    ON pos.product_id = mm.material_id
+  WHERE mm.material_group_name IN (
+      SELECT DISTINCT material_group_name 
+      FROM {Base_table}
+      --WHERE category_name in ('DAIRY','COOKING OILS & GHEE')
+  )
+  AND business_day BETWEEN '2023-06-05' AND '2025-06-01'
+  AND CASE 
+        WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+        THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+        ELSE '2025-W01' 
+      END IN (
+        SELECT DISTINCT week FROM {final_table}
+  )
+  GROUP BY 1, 2
+),
+
+store_counts AS (
+  SELECT 
+    material_id, 
+    week_number, 
+    COUNT(DISTINCT store_id) AS distinct_store_count
+  FROM {txn_data_raw_dg_poc_name}
+  GROUP BY material_id, week_number
+)
+
+SELECT 
+  ci.* except(quantity_ma_2w_excl_current),
+  competitor.num_stores_sold,
+  NULLIF(sc.distinct_store_count, 0) / competitor.num_stores_sold AS num_dist,
+  competitor.competitors_count,
+  COALESCE(
+    LAG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_id ORDER BY week
+    ),
+    AVG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_id
+    )
+  ) AS lag_competition_discount,
+
+  COALESCE(
+    LAG(num_promo_events) OVER (
+      PARTITION BY ci.material_id ORDER BY week
+    ),
+    AVG(num_promo_events) OVER (
+      PARTITION BY ci.material_id
+    )
+  ) AS lag_promo
+FROM cte_with_imputation  ci
+JOIN competitor 
+  ON competitor.material_group_name = ci.material_group_name
+  AND competitor.week_number = ci.week
+JOIN store_counts sc
+  ON sc.material_id = ci.material_id 
+  AND sc.week_number = ci.week
+ORDER BY ci.material_id, week
+"""
+).display()
+spark.sql(f"""
+CREATE OR REPLACE TABLE {mds_material_week_uae} AS 
+WITH cte_raw AS (
+  SELECT
+    week_number,
+    model_name,
+    material_group_name,
+    category_name,
+    SUM(sales) AS sales,
+    SUM(num_txns) AS num_txns,
+    SUM(quantity) AS quantity,
+    ROUND(SUM(sales) / NULLIF(SUM(quantity), 0)) AS unit_price_derived,
+    ROUND(SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0), 2) AS competitor_price,
+    ROUND(
+      (SUM(sales) / NULLIF(SUM(quantity), 0)) / NULLIF((SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0)), 0), 2
+    ) AS competitor_price_ratio,
+    SUM(total_discount) AS total_discount,
+    MAX(has_holidays) AS has_holidays,
+    AVG(avg_regular_unit_price) AS avg_regular_unit_price,
+    AVG(avg_actual_unit_price) AS avg_actual_unit_price,
+    ROUND(SUM(total_discount) / NULLIF((SUM(total_discount) + SUM(sales)), 0), 2) AS total_discount_ratio,
+    SUM(brand_competitors_total_discount) AS brand_competitors_total_discount,
+    AVG(seasonality_idx) AS seasonality_idx,
+    AVG(max_temperature) AS max_temperature,
+    AVG(total_rainfall) AS total_rainfall,
+    MAX(num_promo_events) AS num_promo_events,
+    MAX(total_promo_event_days) AS total_promo_event_days,
+    MAX(max_promo_event_duration) AS max_promo_event_duration,
+    MAX(num_promo_events_on_weekend) AS num_promo_events_on_weekend,
+    CASE 
+  WHEN week IN ('2024-W09', '2024-W10', '2024-W11', '2024-W12', '2024-W13', '2024-W14', '2024-W15') 
+  THEN 1 
+  ELSE 0 
+END AS is_2024_ramadan,
+
+CASE 
+  WHEN  week IN ('2025-W07', '2025-W08', '2025-W09', '2025-W10', '2025-W11','2025-W12', '2025-W13') 
+  THEN 1 
+  ELSE 0 
+END AS is_2025_ramadan
+  FROM {mds_material_week_region}
+  GROUP BY category_name, material_group_name, material_id, week
+),
+
+cte AS (
+  SELECT *,
+    COALESCE(LAG(quantity, 1) OVER (PARTITION BY material_id ORDER BY week),avg(quantity) over(partition by material_id)) AS quantity_lag_1,
+    COALESCE(LAG(quantity, 2) OVER (PARTITION BY material_id ORDER BY week) ,avg(quantity) over(partition by material_id))
+    AS quantity_lag_2,
+    ROUND(
+      (LAG(quantity, 1) OVER (PARTITION BY material_id ORDER BY week) +
+       LAG(quantity, 2) OVER (PARTITION BY material_id ORDER BY week)) / 2.0, 2
+    ) AS quantity_ma_2w_excl_current,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_2w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_3w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_id
+      ORDER BY week
+      ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_5w_ma,
+
+    -- Price moving averages --
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_id ORDER BY week 
+      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_2W,
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_id ORDER BY week 
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_4W,
+
+    -- Quantity vs price ratios --
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_id ORDER BY week ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_4w_derived,
+
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_id ORDER BY week ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_2w_derived,
+
+    -- Competitor price ratio re-used as-is from cte_raw
+    competitor_price_ratio AS brand_competitors_price_ratio
+  FROM cte_raw
+  WINDOW w AS (PARTITION BY material_id ORDER BY week)
+  
+),
+
+cte_with_imputation AS (
+  SELECT *,
+    COALESCE(
+      quantity_ma_2w_excl_current,
+      ROUND(AVG(quantity_ma_2w_excl_current) OVER (PARTITION BY material_id), 2)
+    ) AS quantity_ma_2w,
+    COALESCE(seasonality_2w_ma,avg(seasonality_idx) over (partition by material_id),2) as seasonality_2w,
+     COALESCE(seasonality_3w_ma,avg(seasonality_idx) over (partition by material_id),2)
+    as seasonality_3w,
+    COALESCE(seasonality_5w_ma,avg(seasonality_idx) over (partition by material_id),2)
+    as seasonality_5w
+  FROM cte
+),
+
+competitor AS (
+  SELECT 
+    CASE 
+      WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+      THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+      ELSE '2025-W01' 
+    END AS week_number,
+    mm.material_group_name,
+    COUNT(DISTINCT store_id) AS num_stores_sold,
+    COUNT(DISTINCT CASE WHEN NOT (brand ILIKE '%lulu%' OR brand ILIKE '%repacked%') THEN material_id END) AS competitors_count
+  FROM gold.material.material_master mm 
+  JOIN gold.transaction.uae_pos_transactions pos 
+    ON pos.product_id = mm.material_id
+  WHERE mm.material_group_name IN (
+      SELECT DISTINCT material_group_name 
+      FROM {Base_table}
+      --WHERE category_name in ('DAIRY','COOKING OILS & GHEE')
+  )
+  AND business_day BETWEEN '2023-06-05' AND '2025-06-01'
+  AND CASE 
+        WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+        THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+        ELSE '2025-W01' 
+      END IN (
+        SELECT DISTINCT week FROM {final_table}
+  )
+  GROUP BY 1, 2
+),
+
+store_counts AS (
+  SELECT 
+    material_id, 
+    week_number, 
+    COUNT(DISTINCT store_id) AS distinct_store_count
+  FROM {txn_data_raw_dg_poc_name}
+  GROUP BY material_id, week_number
+)
+
+SELECT 
+  ci.* except(quantity_ma_2w_excl_current),
+  competitor.num_stores_sold,
+  NULLIF(sc.distinct_store_count, 0) / competitor.num_stores_sold AS num_dist,
+  competitor.competitors_count,
+  COALESCE(
+    LAG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_id ORDER BY week
+    ),
+    AVG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_id
+    )
+  ) AS lag_competition_discount,
+
+  COALESCE(
+    LAG(num_promo_events) OVER (
+      PARTITION BY ci.material_id ORDER BY week
+    ),
+    AVG(num_promo_events) OVER (
+      PARTITION BY ci.material_id
+    )
+  ) AS lag_promo
+FROM cte_with_imputation  ci
+JOIN competitor 
+  ON competitor.material_group_name = ci.material_group_name
+  AND competitor.week_number = ci.week
+JOIN store_counts sc
+  ON sc.material_id = ci.material_id 
+  AND sc.week_number = ci.week
+ORDER BY ci.material_id, week
+"""
+).display()
+duplicates_df = spark.sql(f"""
+    SELECT material_id, week, COUNT(*) as cnt
+    FROM {master_table_name_week_final}
+    GROUP BY material_id, week
+    HAVING COUNT(*) > 1
+""")
+
+if duplicates_df.count() > 0:
+    raise ValueError("❌ Duplicate entries found in {master_table_name_week_final} for (material_id, week). Please remove or deduplicate them.")
+%md
+# Material group - Weekly - Region
+weekly_mg_sales_info_query = f"""
+with weekly_sales_info as (
+  SELECT
+    week_number,
+    material_group_name,
+    category_name,
+    region_name,
+    round(sum(amount),2) as sales,
+    count(distinct transaction_id) as num_txns,
+    sum(quantity) as quantity,
+    round(sum(amount)/sum(quantity),2) as unit_price_derived,
+    round(avg(regular_unit_price),2) as avg_regular_unit_price,
+    round(avg(actual_unit_price),2) as avg_actual_unit_price,
+    count(distinct store_id) as num_stores,
+    count(distinct case when day_month in (31,30,1,2,3,4,5) then business_day end) as pay_days 
+
+  FROM
+    {txn_data_raw_dg_poc_name}
+  GROUP BY
+    week_number,
+    material_group_name,
+    category_name,
+    region_name
+    ),
+holiday_info as (
+  select holiday_week, count(holiday_date) as num_holidays
+  from (select holiday_year,
+        cast(holiday_date as date) as holiday_date,
+        CONCAT(YEAR(holiday_date), '-W', LPAD(weekofyear(holiday_date), 2, '0')) as holiday_week,
+        holiday_desc
+        from dev.sandbox.pg_uae_holiday_list)
+  group by holiday_week
+)
+
+select t1.*, case when t4.num_holidays is null then 0 else 1 end as has_holidays
+from weekly_sales_info t1
+left join holiday_info t4
+on t1.week_number = t4.holiday_week
+order by t1.week_number,material_group_name
+"""
+
+df_weekly_mg_sales = spark.sql(weekly_mg_sales_info_query)
+
+df_weekly_mg_sales.createOrReplaceTempView('region_weekly_mg_sales')
+df_weekly_mg_sales.display()
+weekly_promotion_mg = f"""
+WITH weekly_discount_info AS (
+  SELECT
+    CONCAT(YEAR(b.business_day), '-W', LPAD(weekofyear(b.business_day), 2, '0')) AS week_number,
+    material_group_name,
+    region_name,
+    COALESCE(ROUND(SUM(b.total_discount), 2), 0) AS total_discount,
+    COALESCE(COUNT(DISTINCT b.store_id), 0) AS num_stores_discount
+  FROM {Base_table} a
+  LEFT JOIN {promo_table} b ON b.product_id = a.material_id
+  left join gold.store.store_master sm ON sm.store_id = b.store_id
+  WHERE b.disc_perc IS NOT NULL
+  GROUP BY
+    all
+)
+
+select material_group_name,region_name,week_number, total_discount, num_stores_discount
+from  weekly_discount_info cte
+group by all
+"""
+
+weekly_promotion_info_mg = spark.sql(weekly_promotion_mg)
+
+weekly_promotion_info_mg.createOrReplaceTempView('weekly_promotion_mg')
+weekly_promotion_info_mg.display()
+competitor_price_ratio_mg = f"""
+select 
+    rw.week_number,
+    rw.material_group_name,
+    rw.region_name,
+    round(avg(wc.avg_unit_price),2) as comp_avg_unit_price,
+    coalesce(round(avg(rw.avg_unit_price)/avg(wc.avg_unit_price),2),0) as competitors_brand_price_ratio 
+from region_weekly_sales_info rw
+left join weekly_competitors_info wc 
+on  rw.week_number = wc.week_number 
+    and rw.material_group_name = wc.material_group_name
+    and rw.region_name = wc.region_name
+group by
+    rw.week_number,
+    rw.material_group_name,
+    rw.region_name
+"""
+competitor_mg_price_ratio = spark.sql(competitor_price_ratio_mg)
+
+competitor_mg_price_ratio.createOrReplaceTempView('competitor_mg_price_ratio')
+competitor_mg_price_ratio.display()
+
+base_table_mg_weekly = f"""
+SELECT  
+
+rw.week_number,
+rw.material_group_name,
+rw.category_name,
+rw.region_name,
+rw.sales,
+rw.num_txns,
+rw.quantity,
+rw.unit_price_derived,
+rw.avg_regular_unit_price,
+rw.avg_actual_unit_price,
+rw.num_stores,
+rw.has_holidays,
+rw.pay_days,
+
+wc.competitors as brand_competitors_count,
+wc.quantity as brand_competitor_quantity,
+wc.avg_unit_price as brand_competitor_unit_price,
+wc.sales as brand_competitor_sales,
+
+wp.total_discount,
+wp.num_stores_discount,
+
+wcd.total_discount as brand_Competitors_tot_discount,
+wcd.num_stores_on_discount as brand_Competitors_num_stores_disc,
+
+ei.num_events,
+ei.total_event_days,
+ei.max_event_duration,
+ei.num_promo_events_on_weekend,
+
+cpr.competitors_brand_price_ratio,
+
+weather.max_temperature,
+weather.total_rainfall
+
+FROM region_weekly_mg_sales AS rw
+LEFT JOIN weekly_competitors_info AS wc
+ON rw.week_number = wc.week_number AND rw.material_group_name = wc.material_group_name AND rw.region_name = wc.region_name
+LEFT JOIN weekly_promotion_mg AS wp
+ON rw.week_number = wp.week_number AND rw.material_group_name = wp.material_group_name AND rw.region_name = wp.region_name
+LEFT JOIN df_weekly_discount_competitor AS wcd
+ON rw.week_number = wcd.week_number AND rw.material_group_name = wcd.material_group_name AND rw.region_name = wcd.region_name
+LEFT JOIN promo_event_index_week_view AS ei
+ON rw.week_number = ei.week_number
+LEFT JOIN competitor_mg_price_ratio AS cpr
+ON rw.week_number = cpr.week_number AND rw.material_group_name = cpr.material_group_name AND rw.region_name = cpr.region_name
+LEFT JOIN {weekly_weather_data} AS weather
+ON rw.week_number = weather.week_number AND rw.region_name = weather.region_name
+
+"""
+
+base_table_mg_weekly_df = spark.sql(base_table_mg_weekly)
+base_table_mg_weekly_df.createOrReplaceTempView('base_table_mg_weekly')
+base_table_mg_weekly_df.display()
+
+moving_avg_week_mg = f"""
+with ma_added_week_sales as (
+select 
+
+material_group_name,
+region_name,
+week_number,
+sales,
+quantity,
+round(avg(quantity) over(partition by material_group_name, region_name order by week_number rows between 2 preceding and 1 preceding), 3) as ma_2w_qty_new,
+round(avg(quantity) over(partition by material_group_name, region_name order by week_number rows between 4 preceding and 1 preceding), 3) as ma_4w_qty_new,
+round(avg(sales) over(partition by material_group_name, region_name order by week_number rows between 2 preceding and 1 preceding), 3) as ma_2w_sales_new,
+round(avg(sales) over(partition by material_group_name, region_name order by week_number rows between 4 preceding and 1 preceding), 3) as ma_4w_sales_new,
+coalesce(round((ma_2w_sales_new - ma_4w_sales_new) / ma_4w_sales_new, 3), 1.0) as demand_trend,
+round(ma_4w_sales_new / ma_4w_qty_new, 2) as avg_unit_price_ma_4w,
+round(ma_2w_sales_new / ma_2w_qty_new, 2) as avg_unit_price_ma_2w,
+round((sales/quantity) / (ma_4w_sales_new / ma_4w_qty_new), 2) as price_ration_ma_4w_derived,
+round((sales/quantity)/ (ma_2w_sales_new / ma_2w_qty_new), 2) as price_ration_ma_2w_derived
+from base_table_mg_weekly
+)
+
+select * from ma_added_week_sales
+"""
+
+moving_average_week_mg_df = spark.sql(moving_avg_week_mg)
+
+moving_average_week_mg_df.createOrReplaceTempView('moving_average_week_mg')
+display(moving_average_week_mg_df)
+# Step 1: Sort by material_id and week_number
+lag_quantity_week=base_table_mg_weekly_df if isinstance(base_table_mg_weekly_df, pd.DataFrame) else base_table_mg_weekly_df.toPandas()
+lag_quantity_week = lag_quantity_week.sort_values(by=['material_group_name', 'region_name', 'week_number']).reset_index(drop=True)
+
+# Step 2: Create lag features (1-week and 2-week)
+lag_quantity_week['lag_quantity_1w'] = lag_quantity_week['quantity'].shift(1)
+lag_quantity_week['lag_quantity_2w'] = lag_quantity_week['quantity'].shift(2)
+
+# # Need to re-check on this - to replace null with 0 or not
+# lag_quantity_week['lag_quantity_1w'].fillna(lag_quantity_week['lag_quantity_1w'].mean(), inplace=True)
+# lag_quantity_week['lag_quantity_2w'].fillna(lag_quantity_week['lag_quantity_2w'].mean(), inplace=True)
+
+# Step 3: Calculate delta and ratio
+lag_quantity_week['lag_qty_delta'] = lag_quantity_week['lag_quantity_1w'] - lag_quantity_week['lag_quantity_2w']
+lag_quantity_week['lag_qty_ratio'] = lag_quantity_week['lag_quantity_1w'] / (lag_quantity_week['lag_quantity_2w'] + 1e-6)  # avoid divide-by-zero
+
+# Step 4: Round for clean output (optional)
+lag_quantity_week[['lag_qty_delta', 'lag_qty_ratio']] = lag_quantity_week[['lag_qty_delta', 'lag_qty_ratio']].round(2)
+
+# Step 5: creating the trend flag
+def classify_trend(delta):
+    if pd.isna(delta):
+        return None
+    elif delta > 0:
+        return 'Rising'
+    elif delta < 0:
+        return 'Falling'
+    else:
+        return 'Stable'
+lag_quantity_week['trend'] = lag_quantity_week['lag_qty_delta'].apply(classify_trend)
+
+# Step 6: Select only relevant columns
+lag_quantity_week_mg = lag_quantity_week[['material_group_name', 'region_name','week_number', 'quantity', 'lag_quantity_1w', 'lag_quantity_2w','lag_qty_delta','lag_qty_ratio','trend']]
+
+lag_quantity_week_mg = spark.createDataFrame(lag_quantity_week_mg); 
+lag_quantity_week_mg.createOrReplaceTempView('lag_quantity_week_mg')
+display(lag_quantity_week_mg)
+import pandas as pd
+import numpy as np
+
+query_numeric_dist = f"""
+    with  mat_reg_week_store_count AS (
+    select distinct
+    mm.material_group_name,
+    CONCAT(YEAR(b.business_day), '-W', LPAD(weekofyear(b.business_day), 2, '0')) as week_number,
+    region_name,
+    count(distinct b.store_id) as mat_reg_week_stores_count
+    from gold.transaction.uae_pos_transactions  b
+    join gold.material.material_master mm
+    on b.product_id = mm.material_id
+    and mm.material_group_name in (select distinct material_group_name from {Base_table})
+    join gold.store.store_master sm 
+    on sm.store_id = b.store_id
+    where b.business_day between '{START_DATE}' and '{END_DATE}'
+    group by region_name, week_number, mm.material_group_name
+    ),
+
+    reg_week_store_count AS (
+    select 
+    region_name,
+    material_group_name,
+    week_number,
+    count(distinct store_id) as tot_store_count
+    from {txn_data_raw_dg_poc_name}
+    group by region_name, week_number,material_group_name
+    )
+
+    select
+    rw.*,
+    mrw.mat_reg_week_stores_count,
+    round(coalesce(rw.tot_store_count/mrw.mat_reg_week_stores_count,0),2) as num_distr_ratio
+    from reg_week_store_count rw
+    left join mat_reg_week_store_count mrw
+    ON mrw.region_name = rw.region_name and mrw.week_number = rw.week_number
+    and mrw.material_group_name = rw.material_group_name
+"""
+    
+numeric_dist_week = spark.sql(query_numeric_dist)
+#pdf_numeric_dist = sdf_numeric_dist.toPandas()
+
+numeric_dist_week.createOrReplaceTempView('numeric_dist_week_mg')
+numeric_dist_week.display()
+final_mds_table = f"""
+with cte as 
+(
+select 
+    base.week_number as week,
+    base.material_group_name as material_group_name,
+    base.category_name as category_name,
+    base.region_name as region_name,
+    base.sales as sales,
+    coalesce(base.pay_days,0) as pay_days,
+    base.num_txns as txns,
+    base.quantity as quantity,
+    base.unit_price_derived as unit_price_derived,
+    base.avg_regular_unit_price as avg_regular_unit_price,
+    base.avg_actual_unit_price as avg_actual_unit_price,
+    base.num_stores as num_stores_sold,
+    base.has_holidays as has_holidays,
+    base.total_discount as total_discount,
+    base.num_stores_discount as stores_on_discount,
+    round(coalesce(base.brand_competitor_quantity,0),2) as brand_competitor_quantity,
+    round(coalesce(base.brand_competitor_sales,0),2) as brand_competitor_sales,
+    round(coalesce(base.brand_competitor_unit_price,0),2) as brand_competitor_unit_price,
+    round(coalesce(base.brand_competitors_count,0),2) as brand_competitors_count,
+    round(coalesce(base.brand_competitors_tot_discount,0),2) as brand_competitors_total_discount,
+    round(coalesce(base.brand_Competitors_num_stores_disc,0),2) as brand_competitors_stores_discount,
+    round(coalesce(base.num_events,0),2) as num_promo_events,
+    round(coalesce(base.total_event_days,0),2) as total_promo_event_days,
+    round(coalesce(base.max_event_duration,0),2) as max_promo_event_duration,
+    round(coalesce(base.num_promo_events_on_weekend,0),2) as num_promo_events_on_weekend,
+    round(base.competitors_brand_price_ratio,2) as brand_competitors_price_ratio,
+    round(base.max_temperature,2) as max_temperature,
+    round(base.total_rainfall,2) as total_rainfall,
+    round(coalesce(MA_4W_SALES_new,AVG(MA_4W_SALES_new) OVER (partition by base.material_group_name,base.region_name)),2) as MA_4W_SALES,
+    round(coalesce(MA_2W_QTY_new,AVG(MA_2W_QTY_new) OVER (partition by base.material_group_name,base.region_name)),2) as MA_2W_QTY,
+    round(coalesce(avg_unit_price_ma_2w,AVG(avg_unit_price_ma_2w) OVER (partition by base.material_group_name,base.region_name)),2) as avg_unit_price_derived_ma_2W,
+    round(coalesce(MA_4W_QTY_new,AVG(MA_4W_QTY_new) OVER (partition by base.material_group_name,base.region_name)),2) as MA_4W_QTY,
+    round(coalesce(avg_unit_price_ma_4w,AVG(avg_unit_price_ma_4w) OVER (partition by base.material_group_name,base.region_name)),2) as avg_unit_price_ma_4w,
+    round(coalesce(ma_2w_sales_new,AVG(ma_2w_sales_new) OVER (partition by base.material_group_name,base.region_name)),2) as ma_2w_sales,
+    round(coalesce(price_ration_ma_4w_derived,AVG(price_ration_ma_4w_derived) OVER (partition by base.material_group_name,base.region_name)),2) as price_ratio_ma_4w_derived,
+    round(coalesce(price_ration_ma_2w_derived,AVG(price_ration_ma_2w_derived) OVER (partition by base.material_group_name,base.region_name)),2) as price_ratio_ma_2w_derived,
+    round(coalesce(demand_trend,0),2) as demand_trend,
+    seasonality_idx,
+    round(coalesce(lag_quantity_1w,AVG(lag_quantity_1w) OVER (partition by base.material_group_name,base.region_name)),2) as lag_quantity_1w,
+    round(coalesce(lag_quantity_2w,AVG(lag_quantity_2w) OVER (partition by base.material_group_name,base.region_name)),2) as lag_quantity_2w,
+    --round(coalesce(lag_quantity_3w,AVG(lag_quantity_3w) OVER (partition by base.material_group_name,base.region_name)),2) as lag_quantity_3w,
+    round(coalesce(lag_qty_delta,AVG(lag_qty_delta) OVER (partition by base.material_group_name,base.region_name)),2) as lag_qty_delta,
+    round(coalesce(lag_qty_ratio,AVG(lag_qty_ratio) OVER (partition by base.material_group_name,base.region_name)),2) as lag_qty_ratio,
+    coalesce(trend,'Stable') as trend,
+    mat_reg_week_stores_count as material_presence_in_stores,
+    round(coalesce(lag(competitors_brand_price_ratio) over (partition by base.material_group_name,base.region_name order by base.week_number),avg(competitors_brand_price_ratio) over(partition by base.material_group_name,base.region_name)),2) as lag_competitors_brand_price_ratio,
+    tot_store_count as total_stores_mg_region,
+   -- 3-week moving average excluding current row
+ROUND(
+  COALESCE(
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+      ORDER BY base.week_number
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ),
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+    )
+  ),
+  2
+) AS seasonality_3w_ma,
+
+-- 4-week moving average excluding current row
+ROUND(
+  COALESCE(
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+      ORDER BY base.week_number
+      ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+    ),
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+    )
+  ),
+  2
+) AS seasonality_4w_ma,
+
+-- 2-week moving average excluding current row
+ROUND(
+  COALESCE(
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+      ORDER BY base.week_number
+      ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ),
+    AVG(ws.seasonality_idx) OVER (
+      PARTITION BY base.material_group_name, base.region_name
+    )
+  ),
+  2
+) AS seasonality_2w_ma
+,
+    num_distr_ratio,
+  COALESCE(total_discount/(total_discount+base.sales),0) as total_discount_ratio,
+  COALESCE(stores_on_discount/(stores_on_discount+num_stores),0) as stores_on_discount_ratio,
+CASE 
+  WHEN week IN ('2024-W09', '2024-W10', '2024-W11', '2024-W12', '2024-W13', '2024-W14', '2024-W15') 
+  THEN 1 
+  ELSE 0 
+END AS is_2024_ramadan,
+
+CASE 
+  WHEN week IN ('2025-W07', '2025-W08', '2025-W09', '2025-W10', '2025-W11','2025-W12', '2025-W13') 
+  THEN 1 
+  ELSE 0 
+END AS is_2025_ramadan
+
+from base_table_mg_weekly as base
+left join moving_average_week_mg as ma
+on base.material_group_name = ma.material_group_name and base.week_number = ma.week_number and base.region_name = ma.region_name
+left join week_reg_mg_seasonality_idx  ws
+on base.material_group_name = ws.material_group_name and right(base.week_number,3) = ws.week_number_val and base.region_name = ws.region_name
+left join lag_quantity_week_mg as lagw
+on base.material_group_name = lagw.material_group_name and base.week_number = lagw.week_number and base.region_name = lagw.region_name
+left join numeric_dist_week_mg as ndw
+on base.material_group_name = ndw.material_group_name and base.week_number = ndw.week_number and base.region_name = ndw.region_name
+)
+
+SELECT *,
+  COALESCE(
+    LAG(brand_competitors_total_discount) OVER (
+      PARTITION BY material_group_name, region_name ORDER BY week
+    ),
+    AVG(brand_competitors_total_discount) OVER (
+      PARTITION BY material_group_name, region_name
+    )
+  ) AS lag_competition_discount,
+    COALESCE(LAG(total_discount) OVER (
+           PARTITION BY material_group_name, region_name -- adjust based on your grain
+           ORDER BY week 
+         ),0) AS lagged_total_discount,
+
+  COALESCE(
+    LAG(num_promo_events) OVER (
+      PARTITION BY material_group_name, region_name ORDER BY week
+    ),
+    AVG(num_promo_events) OVER (
+      PARTITION BY material_group_name, region_name
+    )
+  ) AS lag_promo
+
+FROM cte
+
+"""
+
+final_mds = spark.sql(final_mds_table).toPandas()
+final_mds.head()
+spark_df = spark.createDataFrame(final_mds)
+spark_df.write.mode("overwrite").saveAsTable(f"{master_table_mg_region}")
+%sql
+select material_group_name,sum(amount),sum(quantity)
+from gold.transaction.uae_pos_transactions pos 
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where 1=1
+and (brand ilike '%lulu%' or brand ilike '%repacked%')
+and pos.ean in (select distinct ean from dev.sandbox.av_pricing_final_skus where material_group_name = 'BASMATI')
+and business_day between '2023-06-05' and '2023-06-11'
+and region_name = 'AL AIN'
+and material_group_name = 'BASMATI'
+and bulk_sale_flag is null
+and amount >0
+group by all
+spark.sql(f'select * from {master_table_mg_region} order by material_group_name,week').display()
+from pyspark.sql import functions as F
+
+# Load your table
+df = spark.table(f"{master_table_mg_region}")
+
+# Find duplicates
+duplicates = df.groupBy("material_group_name", "week", "region_name") \
+    .count() \
+    .filter(F.col("count") > 1)
+
+# Raise error if duplicates are found
+if duplicates.limit(1).count() > 0:
+    sample_dupes = duplicates.limit(10).toPandas().to_dict(orient="records")
+    raise ValueError(f"❌ Duplicate records found for (material_group_name, week, region_name): {sample_dupes}")
+else:
+    print("✅ No duplicates found.")
+%md
+# Material group - Weekly - UAE
+spark.sql(f"""
+create or replace table {master_table_mg_uae} as 
+WITH cte_raw AS (
+  SELECT
+    category_name,
+    material_group_name,
+    week,
+    SUM(sales) AS sales,
+    SUM(quantity) AS quantity,
+    ROUND(SUM(sales) / NULLIF(SUM(quantity), 0)) AS unit_price_derived,
+    ROUND(SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0), 2) AS competitor_price,
+    ROUND(
+      (SUM(sales) / NULLIF(SUM(quantity), 0)) / NULLIF((SUM(brand_competitor_sales) / NULLIF(SUM(brand_competitor_quantity), 0)), 0), 2
+    ) AS competitor_price_ratio,
+    SUM(total_discount) AS total_discount,
+    MAX(has_holidays) AS has_holidays,
+    AVG(avg_regular_unit_price) AS avg_regular_unit_price,
+    AVG(avg_actual_unit_price) AS avg_actual_unit_price,
+    ROUND(nullif(SUM(total_discount),0) / NULLIF((SUM(total_discount) + SUM(sales)), 0), 2) AS total_discount_ratio,
+    SUM(brand_competitors_total_discount) AS brand_competitors_total_discount,
+    AVG(seasonality_idx) AS seasonality_idx,
+    AVG(max_temperature) AS max_temperature,
+    AVG(total_rainfall) AS total_rainfall,
+    MAX(num_promo_events) AS num_promo_events,
+    MAX(total_promo_event_days) AS total_promo_event_days,
+    MAX(max_promo_event_duration) AS max_promo_event_duration,
+    MAX(num_promo_events_on_weekend) AS num_promo_events_on_weekend,
+    CASE 
+  WHEN week IN ('2024-W09', '2024-W10', '2024-W11', '2024-W12', '2024-W13', '2024-W14', '2024-W15') 
+  THEN 1 
+  ELSE 0 
+END AS is_2024_ramadan,
+
+CASE 
+  WHEN  week IN ('2025-W07', '2025-W08', '2025-W09', '2025-W10', '2025-W11','2025-W12', '2025-W13') 
+  THEN 1 
+  ELSE 0 
+END AS is_2025_ramadan
+  FROM {master_table_mg_region}
+  GROUP BY category_name, material_group_name, week
+),
+
+cte AS (
+  SELECT *,
+    COALESCE(LAG(quantity, 1) OVER (PARTITION BY material_group_name ORDER BY week),avg(quantity) over(partition by material_group_name)) AS quantity_lag_1,
+    COALESCE(LAG(quantity, 2) OVER (PARTITION BY material_group_name ORDER BY week) ,avg(quantity) over(partition by material_group_name))
+    AS quantity_lag_2,
+    ROUND(
+      (LAG(quantity, 1) OVER (PARTITION BY material_group_name ORDER BY week) +
+       LAG(quantity, 2) OVER (PARTITION BY material_group_name ORDER BY week)) / 2.0, 2
+    ) AS quantity_ma_2w_excl_current,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_group_name
+      ORDER BY week
+      ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_2w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_group_name
+      ORDER BY week
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_3w_ma,
+
+    ROUND(AVG(seasonality_idx) OVER (
+      PARTITION BY material_group_name
+      ORDER BY week
+      ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+    ), 2) AS seasonality_5w_ma,
+
+    -- Price moving averages --
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_group_name ORDER BY week 
+      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_2W,
+    AVG(unit_price_derived) OVER (
+      PARTITION BY material_group_name ORDER BY week 
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS avg_unit_price_derived_ma_4W,
+
+    -- Quantity vs price ratios --
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_group_name ORDER BY week ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_4w_derived,
+
+    unit_price_derived 
+      / NULLIF(AVG(unit_price_derived) OVER (
+           PARTITION BY material_group_name ORDER BY week ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ),0)
+      AS price_ratio_ma_2w_derived,
+
+    -- Competitor price ratio re-used as-is from cte_raw
+    competitor_price_ratio AS brand_competitors_price_ratio
+  FROM cte_raw
+  WINDOW w AS (PARTITION BY material_group_name ORDER BY week)
+  
+),
+
+cte_with_imputation AS (
+  SELECT *,
+    COALESCE(
+      quantity_ma_2w_excl_current,
+      ROUND(AVG(quantity_ma_2w_excl_current) OVER (PARTITION BY material_group_name), 2)
+    ) AS quantity_ma_2w,
+    COALESCE(seasonality_2w_ma,avg(seasonality_idx) over (partition by material_group_name),2) as seasonality_2w,
+     COALESCE(seasonality_3w_ma,avg(seasonality_idx) over (partition by material_group_name),2)
+    as seasonality_3w,
+    COALESCE(seasonality_5w_ma,avg(seasonality_idx) over (partition by material_group_name),2)
+    as seasonality_5w
+  FROM cte
+),
+
+competitor AS (
+  SELECT 
+    CASE 
+      WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+      THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+      ELSE '2025-W01' 
+    END AS week_number,
+    mm.material_group_name,
+    COUNT(DISTINCT store_id) AS num_stores_sold,
+    COUNT(DISTINCT CASE WHEN NOT (brand ILIKE '%lulu%' OR brand ILIKE '%repacked%') THEN material_group_name END) AS competitors_count
+  FROM gold.material.material_master mm 
+  JOIN gold.transaction.uae_pos_transactions pos 
+    ON pos.product_id = mm.material_id
+  WHERE mm.material_group_name IN (
+      SELECT DISTINCT material_group_name 
+      FROM dev.sandbox.av_base_table 
+  )
+  AND business_day BETWEEN '2023-06-05' AND '2025-06-01'
+  AND CASE 
+        WHEN business_day NOT BETWEEN '2024-12-30' AND '2024-12-31' 
+        THEN CONCAT(YEAR(business_day), '-W', LPAD(WEEKOFYEAR(business_day), 2, '0'))
+        ELSE '2025-W01' 
+      END IN (
+        SELECT DISTINCT week FROM {master_table_name_week_final}
+  )
+  GROUP BY 1, 2
+),
+
+store_counts AS (
+  SELECT 
+    material_group_name, 
+    week_number, 
+    COUNT(DISTINCT store_id) AS distinct_store_count
+  FROM {txn_data_raw_dg_poc_name}
+  GROUP BY material_group_name, week_number
+)
+
+SELECT 
+  ci.* except(quantity_ma_2w_excl_current),
+  competitor.num_stores_sold,
+  NULLIF(sc.distinct_store_count, 0) / competitor.num_stores_sold AS num_dist,
+  competitor.competitors_count,
+  COALESCE(
+    LAG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_group_name ORDER BY week
+    ),
+    AVG(brand_competitors_total_discount) OVER (
+      PARTITION BY ci.material_group_name
+    )
+  ) AS lag_competition_discount,
+
+  COALESCE(
+    LAG(num_promo_events) OVER (
+      PARTITION BY ci.material_group_name ORDER BY week
+    ),
+    AVG(num_promo_events) OVER (
+      PARTITION BY ci.material_group_name
+    )
+  ) AS lag_promo
+FROM cte_with_imputation  ci
+JOIN competitor 
+  ON competitor.material_group_name = ci.material_group_name
+  AND competitor.week_number = ci.week
+JOIN store_counts sc
+  ON sc.material_group_name = ci.material_group_name 
+  AND sc.week_number = ci.week
+ORDER BY ci.material_group_name, week;
+""").display()
+from pyspark.sql import functions as F
+
+# Load your table
+df = spark.table(f"{master_table_mg_uae}")
+
+# Find duplicates
+duplicates = df.groupBy("material_group_name", "week") \
+    .count() \
+    .filter(F.col("count") > 1)
+
+# Raise error if duplicates are found
+if duplicates.limit(1).count() > 0:
+    sample_dupes = duplicates.limit(10).toPandas().to_dict(orient="records")
+    raise ValueError(f"❌ Duplicate records found for (material_group_name, week): {sample_dupes}")
+else:
+    print("✅ No duplicates found.")
+%md
+#Validation
+from pyspark.sql.types import *
+
+schema = StructType([
+    StructField("material_id", StringType(), True),
+    StructField("week", StringType(), True),
+    StructField("material_name", StringType(), True),
+    StructField("material_group_name", StringType(), True),
+    StructField("category_name", StringType(), True),
+    StructField("region_name", StringType(), True),
+    StructField("sales", DoubleType(), True),
+    StructField("pay_days", LongType(), True),
+    StructField("txns", LongType(), True),
+    StructField("quantity", DoubleType(), True),
+    StructField("unit_price_derived", DoubleType(), True),
+    StructField("avg_regular_unit_price", DoubleType(), True),
+    StructField("avg_actual_unit_price", DoubleType(), True),
+    StructField("num_stores_sold", LongType(), True),
+    StructField("has_holidays", IntegerType(), True),
+    StructField("total_discount", DoubleType(), True),
+    StructField("stores_on_discount", LongType(), True),
+    StructField("brand_competitor_quantity", DoubleType(), True),
+    StructField("brand_competitor_sales", DoubleType(), True),
+    StructField("brand_competitor_unit_price", DoubleType(), True),
+    StructField("brand_competitors_count", LongType(), True),
+    StructField("brand_competitors_total_discount", DoubleType(), True),
+    StructField("brand_competitors_stores_discount", LongType(), True),
+    StructField("num_promo_events", LongType(), True),
+    StructField("total_promo_event_days", LongType(), True),
+    StructField("max_promo_event_duration", LongType(), True),
+    StructField("num_promo_events_on_weekend", LongType(), True),
+    StructField("brand_competitors_price_ratio", DoubleType(), True),
+    StructField("max_temperature", FloatType(), True),
+    StructField("total_rainfall", FloatType(), True),
+    StructField("MA_4W_SALES", DoubleType(), True),
+    StructField("MA_2W_QTY", DoubleType(), True),
+    StructField("avg_unit_price_derived_ma_2W", DoubleType(), True),
+    StructField("MA_4W_QTY", DoubleType(), True),
+    StructField("avg_unit_price_ma_4w", DoubleType(), True),
+    StructField("ma_2w_sales", DoubleType(), True),
+    StructField("price_ratio_ma_4w_derived", DoubleType(), True),
+    StructField("price_ratio_ma_2w_derived", DoubleType(), True),
+    StructField("demand_trend", DoubleType(), True),
+    StructField("seasonality_idx", DoubleType(), True),
+    StructField("seasonality_mg_idx", DoubleType(), True),
+    StructField("lag_quantity_1w", DoubleType(), True),
+    StructField("lag_quantity_2w", DoubleType(), True),
+    StructField("lag_quantity_3w", DoubleType(), True),
+    StructField("lag_qty_delta", DoubleType(), True),
+    StructField("lag_qty_ratio", DoubleType(), True),
+    StructField("trend", StringType(), True),
+    StructField("material_presence_in_stores", LongType(), True),
+    StructField("lag_competitors_brand_price_ratio", DoubleType(), True),
+    StructField("total_stores_mg_region", LongType(), True),
+    StructField("seasonality_3w_ma", DoubleType(), True),
+    StructField("seasonality_4w_ma", DoubleType(), True),
+    StructField("seasonality_2w_ma", DoubleType(), True),
+    StructField("num_distr_ratio", DoubleType(), True),
+    StructField("total_discount_ratio", DoubleType(), True),
+    StructField("stores_on_discount_ratio", DoubleType(), True),
+    StructField("is_2024_ramadan", IntegerType(), True),
+    StructField("is_2025_ramadan", IntegerType(), True),
+    StructField("lag_competition_discount", DoubleType(), True),
+    StructField("lagged_total_discount", DoubleType(), True),
+    StructField("lag_promo", DoubleType(), True)
+])
+df = spark.table(f"{final_table}")
+
+# 3. Check schema conformity
+actual_schema = df.schema
+if schema != actual_schema:
+    raise ValueError("Schema mismatch! Actual schema does not match the expected schema.")
+
+print("✅ Schema matches expected structure.")
+from pyspark.sql.functions import col, round
+
+# Define expected float/double columns
+expected_float_cols = [
+    "sales", "unit_price_derived", "avg_regular_unit_price", "avg_actual_unit_price",
+    "num_stores_sold", "has_holidays", "total_discount", "brand_competitor_sales",
+    "brand_competitor_unit_price", "brand_competitors_total_discount",
+    "brand_competitors_price_ratio", "max_temperature", "total_rainfall",
+    "MA_4W_SALES", "MA_2W_QTY", "avg_unit_price_derived_ma_2W", "MA_4W_QTY",
+    "avg_unit_price_ma_4w", "ma_2w_sales", "price_ratio_ma_4w_derived",
+    "price_ratio_ma_2w_derived", "demand_trend", "seasonality_idx", "lag_qty_delta",
+    "lag_qty_ratio", "lag_competitors_brand_price_ratio", "total_stores_mg_region",
+    "seasonality_3w_ma", "seasonality_4w_ma", "seasonality_2w_ma", "num_distr_ratio",
+    "total_discount_ratio", "stores_on_discount_ratio", "lagged_total_discount"
+]
+
+# Load the table
+df = spark.sql(f"SELECT * FROM {final_table}")
+
+# Check float/double columns for precision > 2 decimal places
+precision_issues = {}
+for c in expected_float_cols:
+    if c in df.columns:
+        diff_df = df.withColumn("diff", (col(c) - round(col(c), 2)).cast("double"))
+        max_diff = diff_df.selectExpr("max(abs(diff)) as max_diff").collect()[0]['max_diff']
+        if max_diff and max_diff > 1e-6:
+            precision_issues[c] = max_diff
+
+if precision_issues:
+    raise ValueError(f"❌ Columns with >2 decimal precision: {precision_issues}")
+
+print("✅ Float precision check passed.")
+from pyspark.sql.functions import min, max, count
+
+df = spark.sql(f"SELECT * FROM {final_table}")
+
+summary_df = df.groupBy("material_id", "material_name", "category_name","region_name") \
+    .agg(
+        min("unit_price_derived").alias("min_unit_price"),
+        max("unit_price_derived").alias("max_unit_price"),
+        min("week").alias("min_week"),
+        max("week").alias("max_week"),
+        count("*").alias("row_count")
+    )
+
+summary_df.createOrReplaceTempView('summary_final_table')
+cogs_df = spark.sql(f"""
+
+with final_num AS
+(
+  select
+    final.Region,
+    final.category_name,
+    final.material_group_name,
+    final.material_id,
+    final.ean,
+    final.material_name,
+    final.Last_12W_price as Current_12W_Price_in_POS,
+    round(final.Final_Recommended_Price,2) as Final_Recommended_Price,
+    final.Price_Direction,
+    -- final.'#_Regions_Recommended_by_sku',
+    round(final.price_inc_or_dec*100) as Price_Change_perc,
+    mem.unit,
+    mem.numerator,
+    mem.denominator
+  from analytics.pricing.setb_final_recommendation as final
+  join gold.material.material_ean_master as mem
+    ON final.material_id = mem.material_id
+    AND final.ean = mem.ean
+),
+
+cte as 
+(
+  select 
+    ean.*,
+    left(business_date,6) as month,
+    round(avg(sd.moving_avg_price),2) as cost_per_unit,
+    round(avg(sd.moving_avg_price)*numerator,2) as cogs 
+  from gold.store.stock_details sd 
+  left join gold.store.store_master sm 
+    on sm.store_id = sd.store_id
+  join final_num as ean 
+    on sd.material_id = ean.material_id 
+    and ean.Region = sm.region_name
+  group by all
+)
+
+select * 
+from cte
+qualify row_number() over (partition by material_id,Region,ean order by month desc) = 1
+
+""")
+
+# spark_df = spark.sql(cogs_df)
+pd_df = cogs_df.toPandas().to_csv('/Workspace/Users/811991@lulumea.com/Exported Files/pl_pricing_setb_cogs.csv', index=False)

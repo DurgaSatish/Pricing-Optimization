@@ -1,0 +1,1666 @@
+%md
+## Summary
+
+###### This notebook flags the store-business_day-material level violation using valid_price_flag.The main table is dev.sandbox.am_test that supports BI dashboards
+###### Criteria for violation : Tolerance of 2% from suggested price 
+###### Run this notebook and then final measurement
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+import numpy as np
+import pandas as pd
+import re
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
+import warnings
+%sql
+select * 
+from dev.sandbox.av_accepted_file
+%sql
+create or replace table dev.sandbox.av_all_ean_seta
+with base as 
+(
+  select sr.* except(category_name,Material_group_name),mm.material_group_name,mm.category_name
+  from analytics.pricing.seta_accepted_recommendation_info sr
+  left join gold.material.material_master mm 
+  on sr.material_id = mm.material_id
+)
+,ean_info as 
+(
+select distinct base.*,mem.numerator,mem.denominator
+from base  
+left join gold.material.material_ean_master mem 
+on mem.material_id = base.material_id 
+and bigint(base.ean) = bigint(mem.ean)
+)
+,base_ean as 
+(
+select * except(insert_date,insert_utc_timestamp,mem.material_id,ean_info.ean,mem.numerator,mem.denominator,mem.material_name)
+from ean_info 
+left join gold.material.material_ean_master mem 
+on mem.material_id = ean_info.material_id 
+and ean_info.numerator = mem.numerator 
+and ean_info.denominator = mem.denominator
+and mem.unit != 'ZU'
+)
+,implementation as 
+(
+select base_ean.*except(ean),base_ean.ean as ean_final,coalesce(min(business_day),implementation_date) as implementation_final
+from  base_ean 
+join gold.store.store_master sm 
+on base_ean.region_name =sm.region_name 
+left join gold.transaction.uae_pos_transactions pos 
+on base_ean.material_id = pos.product_id
+-- and base_ean.ean = pos.ean
+and pos.store_id = sm.store_id
+and business_day >= implementation_date
+and regular_unit_price = accepted_price
+group by all
+)
+
+,cogs as 
+(
+  select sd.*,sm.region_name,row_number() over (partition by material_id,region_name order by month(business_date) desc) as rn
+  from gold.store.store_master sm 
+  left join gold.store.stock_details sd 
+  on sd.store_id = sm.store_id
+  where (material_id,region_name) in (select distinct material_id,region_name from implementation)
+  
+)
+,latest_cogs as 
+(
+  select material_id,region_name,round(avg(moving_avg_price),2) as base_cost
+  from cogs 
+  where rn = 1
+  group by all
+)
+,final as 
+(
+select imp.*,cogs.base_cost as base_cost,round((imp.numerator/imp.denominator)* cogs.base_cost,2) as unit_cost
+from implementation imp
+left join latest_cogs cogs 
+on cogs.material_id = imp.material_id 
+and cogs.region_name = imp.region_name
+)
+
+select sr.material_id,sr.region_name,sr.Material_name,round(sr.Final_recommnedation,2) as expected_price,ae.* except(ae.material_id,ae.region_name,Material_name,implementation_final,expected_price,ean_final,material_group_name,category_name),coalesce(implementation_final,'2025-08-14') as implementation_final,coalesce(ae.ean_final,sr.ean) as ean_final,mm.material_group_name,mm.category_name
+from analytics.pricing.seta_final_recommendation sr
+left join final ae 
+on ae.material_id = sr.material_id
+and ae.region_name = sr.region_name
+left join gold.material.material_master mm 
+on mm.material_id = sr.material_id
+%sql
+create or replace table dev.sandbox.av_all_ean_setb
+with base as 
+(
+  select sr.*,mm.material_group_name,mm.category_name
+  from  analytics.pricing.setb_accepted_recommendation_info sr 
+  left join gold.material.material_master mm 
+  on sr.material_id = mm.material_id
+)
+,ean_info as 
+(
+select distinct base.*,mem.numerator,mem.denominator
+from base  
+left join gold.material.material_ean_master mem 
+on mem.material_id = base.material_id 
+and base.ean = mem.ean
+)
+,base_ean as 
+(
+select * except(insert_date,insert_utc_timestamp,mem.material_id,ean_info.ean,mem.numerator,mem.denominator,mem.material_name)
+from ean_info 
+left join gold.material.material_ean_master mem 
+on mem.material_id = ean_info.material_id 
+and ean_info.numerator = mem.numerator 
+and ean_info.denominator = mem.denominator
+and mem.unit != 'ZU'
+)
+,implementation as 
+(
+select base_ean.*except(ean,Final_Recommended_Price,Price_Direction,region),Final_Recommended_Price as expected_price,base_ean.ean as ean_final,region as region_name,coalesce(min(business_day),implementation_date,'2025-10-03') as implementation_final,Price_Direction as price_change_direction
+from  base_ean 
+join gold.store.store_master sm 
+on base_ean.region =sm.region_name 
+left join gold.transaction.uae_pos_transactions pos 
+on base_ean.material_id = pos.product_id
+-- and base_ean.ean = pos.ean
+and pos.store_id = sm.store_id
+and business_day >= implementation_date
+and regular_unit_price = accepted_price
+group by all
+)
+,cogs as 
+(
+  select sd.*,sm.region_name,row_number() over (partition by material_id,region_name order by month(business_date) desc) as rn
+  from gold.store.store_master sm 
+  left join gold.store.stock_details sd 
+  on sd.store_id = sm.store_id
+  where (material_id,region_name) in (select distinct material_id,region_name from implementation)
+  
+)
+,latest_cogs as 
+(
+  select material_id,region_name,round(avg(moving_avg_price),2) as base_cost
+  from cogs 
+  where rn = 1
+  group by all
+)
+,final as (
+select imp.*,cogs.base_cost as base_cost,round((imp.numerator/imp.denominator)* cogs.base_cost,2) as unit_cost
+from implementation imp
+left join latest_cogs cogs 
+on cogs.material_id = imp.material_id 
+and cogs.region_name = imp.region_name
+)
+
+select sr.material_id,sr.region as region_name,sr.Material_name,round(sr.Final_Recommended_Price,2) as expected_price,ae.* except(ae.material_id,ae.region_name,Material_name,implementation_final,expected_price,ean_final,material_group_name,category_name),coalesce(implementation_final,'2025-08-14') as implementation_final,coalesce(ae.ean_final,sr.ean) as ean_final,mm.material_group_name,mm.category_name
+from analytics.pricing.setb_final_recommendation sr
+left join final ae 
+on ae.material_id = sr.material_id
+and ae.region_name = sr.region
+left join gold.material.material_master mm 
+on mm.material_id = sr.material_id
+%sql
+-- If a new Set comes up, add that new table and union at the end
+create or replace table dev.sandbox.av_all_ean
+with seta_file as 
+(
+    select 'SETA Pricing August 2025' as program_name,material_id,region_name,material_name,price_change_direction,material_group_name,category_name,previous_price,ean_final,accepted_price,implementation_date,implementation_final,unit,numerator,denominator,base_cost,unit_cost,expected_price
+    from dev.sandbox.av_all_ean_seta
+)
+,setb_file as 
+(
+    select 'SETB Pricing October 2025' as program_name,material_id,region_name,material_name,price_change_direction,material_group_name,category_name,previous_price,ean_final,accepted_price,implementation_date,implementation_final,unit,numerator,denominator,base_cost,unit_cost,expected_price
+    from dev.sandbox.av_all_ean_setb
+)
+
+select * from seta_file
+union
+select * from setb_file
+recommended_table_seta = 'analytics.pricing.seta_final_recommendation'
+recommended_table_setb = 'analytics.pricing.setb_final_recommendation'
+Accepted_table = 'dev.sandbox.av_all_ean'#'dev.sandbox.av_accepted_file'
+Final_table = 'analytics.pricing.accepted_recommendation_info_new'# 'analytics.pricing.seta_accepted_recommendation_info'
+df = spark.table(f'{Accepted_table}')
+%sql
+select program_name,count(distinct material_id) 
+from dev.sandbox.av_all_ean 
+where accepted_price is not null
+group by all
+df.display()
+from pyspark.sql import functions as F
+from datetime import datetime, timedelta
+
+# If the Implementation Period is 3 months then run the code as it is, or else change the days count value of the variable num_days
+# current_date cutoff (1 day prior to today)
+current_date = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+# This below date is for capturing the baseline data, which is the Last 3 months start date used in the final model price recommendation
+start_date_pre = '2025-04-20'
+
+# baseline = 12 weeks = 84 days
+BASELINE_NUM_DAYS = 104
+num_days = 90
+df_spark = (
+    df
+    # Parse dd.MM.yyyy -> date type
+    # .withColumn("implementation_final", F.to_date("implementation_final", "dd.MM.yyyy"))
+    
+    # Compute end_date = implementation_date + 30 days
+    .withColumn("end_date", F.date_add(F.col("implementation_final"), num_days))
+    
+    # Apply current_date cutoff for final_end_date
+    .withColumn("final_end_date", F.least(F.col("end_date"), F.to_date(F.lit(current_date), "yyyy-MM-dd")))
+    
+    # Compute number of implementation days
+    .withColumn(
+        "num_implementation_days",
+        F.datediff(F.col("final_end_date"), F.col("implementation_final")) + F.lit(1)
+    )
+    
+    # ---- PRE PERIOD CALCULATIONS ----
+    # Start date of pre-period = 12 weeks before implementation
+   .withColumn('start_date_pre', F.lit(f'{start_date_pre}'))
+    
+    # End date of pre-period (aligned to implementation duration)
+    .withColumn("end_date_pre", F.expr("date_add(start_date_pre, num_implementation_days - 1)"))
+    
+    # End date of overall pre-period baseline (full 84 days)
+    .withColumn("end_date_pre_overall", F.date_add(F.col("start_date_pre"), BASELINE_NUM_DAYS))
+    
+    # Equivalent pre-period length (in days)
+    .withColumn("num_equivalent_days", F.datediff(F.col("end_date_pre"), F.col("start_date_pre")) + F.lit(1))
+    
+    # Standardize dates into yyyy-MM-dd (optional)
+    .withColumn("implementation_final", F.date_format("implementation_final", "yyyy-MM-dd"))
+    .withColumn("end_date", F.date_format("end_date", "yyyy-MM-dd"))
+    .withColumn("final_end_date", F.date_format("final_end_date", "yyyy-MM-dd"))
+    .withColumn("start_date_pre", F.date_format("start_date_pre", "yyyy-MM-dd"))
+    .withColumn("end_date_pre", F.date_format("end_date_pre", "yyyy-MM-dd"))
+    .withColumn("end_date_pre_overall", F.date_format("end_date_pre_overall", "yyyy-MM-dd"))
+)
+
+df_spark.display()
+df_spark.write.option('overwriteSchema',True).mode('overwrite').saveAsTable(f'{Final_table}')
+%sql
+select distinct 
+  concat_ws(
+    ', ',
+    collect_list(distinct concat("'", INITCAP(material_group_name), "'"))
+  ) AS formatted_list
+ from analytics.pricing.accepted_recommendation_info_new
+where program_name = 'SETB Pricing October 2025'
+%sql
+select * from analytics.pricing.accepted_recommendation_info_new
+# implementation period txn ==> Baseline Period
+
+pre_txn_query_string = f"""
+with hhc_txn_data_raw_AUH as (
+select
+at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'ABU DHABI'
+),
+hhc_txn_data_raw_DXB as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and  bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'DUBAI'
+--and upper(t3.store_format) in ('HYPERMARKET')
+),
+hhc_txn_data_raw_shj as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and  bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'SHARJAH'
+)
+,hhc_txn_data_raw_alain as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and  bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'AL AIN'
+and bulk_sale_flag is null
+--and upper(t3.store_format) in ('HYPERMARKET')
+)
+
+
+
+select *
+from hhc_txn_data_raw_AUH
+union
+select * 
+from hhc_txn_data_raw_DXB
+union
+select *
+from hhc_txn_data_raw_alain
+union
+select * 
+from hhc_txn_data_raw_shj
+"""
+
+
+df_pre_txn_info =  spark.sql(pre_txn_query_string)
+df_pre_txn_info.createOrReplaceTempView("pre_txn_info_view")
+df_pre_txn_info.display()
+# implementation period txn
+test_txn_query_string = f"""
+with implementation_dubai as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'DUBAI'
+)
+,implementation_auh as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'ABU DHABI'
+)
+,implementation_shj as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'SHARJAH'
+)
+,implementation_alain as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and bigint(at.ean_final) = bigint(t1.ean) 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SALE_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'AL AIN'
+)
+
+select *
+from implementation_dubai
+union
+select * 
+from implementation_auh
+union
+select * 
+from implementation_shj
+union
+select * from implementation_alain
+"""
+
+
+df_test_txn_info =  spark.sql(test_txn_query_string)
+df_test_txn_info.createOrReplaceTempView("test_txn_info_view")
+df_test_txn_info.display()
+%sql
+
+-- this view contains the 'pre' and 'test' period merged 'daily aggregated' txn data for all stores and
+-- all SKUs in the region_list and mg_list and not just test SKUs and experiment stores
+-- filtering for test SKUs and experiment stores will be done later when needed
+
+create or replace temp view daily_agg_txn_info_merged_view as (
+
+with test_period_daily_aggregates as (
+  select
+  program_name,
+  'test_period' as period_type,
+  'test' as period_sub_type,
+  material_group_name,
+  category_name,
+  region_name,
+  store_id,
+  material_id,
+  ean,
+  business_day,
+  week_number,
+  count(distinct transaction_id) as num_txn,
+  sum(quantity) as total_qty,
+  sum(amount) as total_sales,
+  avg(unit_price) as avg_unit_price,
+  avg(regular_unit_price) as avg_regular_unit_price
+  from test_txn_info_view
+  group by material_group_name, region_name, store_id, material_id,ean, business_day, week_number,program_name,category_name
+),
+
+pre_period_daily_aggregates as (
+  select
+  program_name,
+  'pre_period' as period_type,
+  period_sub_type,
+  material_group_name,
+  category_name,
+  region_name,
+  store_id,
+  material_id,
+  ean,
+  business_day,
+  week_number,
+  count(distinct transaction_id) as num_txn,
+  sum(quantity) as total_qty,
+  sum(amount) as total_sales,
+  avg(unit_price) as avg_unit_price,
+  avg(regular_unit_price) as avg_regular_unit_price
+  from pre_txn_info_view
+  group by period_sub_type, material_group_name, region_name, store_id, material_id,ean, business_day, week_number,program_name,category_name
+)
+
+
+-- merge both data sources
+select * from test_period_daily_aggregates
+union
+select * from pre_period_daily_aggregates
+
+)
+df_daily_txn_merged_raw = spark.sql(f"""select * from daily_agg_txn_info_merged_view""")
+df_daily_txn_merged_raw.write.mode("overwrite").option("mergeSchema", "true").saveAsTable("dev.sandbox.pricing_measurement_raw_txn_data")
+spark.sql(f"""
+create or replace table dev.sandbox.all_stores_view as 
+with cte as 
+(
+  select distinct program_name,store_id,ean,material_id,region_name
+  from dev.sandbox.pricing_measurement_raw_txn_data pm 
+  where pm.period_type = 'pre_period'
+)
+,stores as 
+(
+  select distinct region_name,sm.store_id,store_name 
+  from gold.transaction.uae_pos_transactions pos 
+  -- join gold.material.material_master mm 
+  -- on mm.material_id = pos.product_id
+  join gold.store.store_master sm 
+  on sm.store_id = pos.store_id
+  where business_day between current_date - 90 and current_date
+  and amount >0
+)
+,base as 
+(
+select st.*,seta.* except(region_name)
+from stores st
+join analytics.pricing.accepted_recommendation_info_new seta
+on st.region_name = seta.region_name
+)
+
+select base.*except(ean_final),ean_final as ean
+from base
+join cte 
+on base.material_id = cte.material_id 
+and base.ean_final = cte.ean 
+and base.store_id = cte.store_id
+and base.region_name = cte.region_name
+""")
+all_stores_df = spark.sql(f"""select * from dev.sandbox.all_stores_view""").toPandas()
+%sql
+SELECT 
+    program_name,
+    region_name,
+    COUNT(DISTINCT material_id) AS material_count
+FROM dev.sandbox.all_stores_view
+GROUP BY program_name, region_name ;
+all_stores_df.groupby(['program_name','price_change_direction','region_name'])['material_id'].nunique()
+%sql
+create or replace temp view test_price_validation_view as (
+with test_expected_prices as (
+
+  select distinct program_name,region_name, material_id,ean,accepted_price
+  from  dev.sandbox.all_stores_view
+),
+pre_period as (
+  select distinct program_name,region_name, material_id, ean,store_id 
+  from dev.sandbox.pricing_measurement_raw_txn_data 
+  where period_type = 'pre_period'
+)
+,test_price_validation_info as (
+  select distinct t1.program_name,t1.region_name, t1.store_id, t1.material_id, --t2.experiment_group
+  t1.business_day, t1.num_txn, t1.avg_regular_unit_price as observed_price, t3.accepted_price,
+  abs(t3.accepted_price-observed_price) as price_deviation,t1.ean as ean,
+  
+  --- tolerance threshold is 2%
+  case when abs(price_deviation/t3.accepted_price) <= 0.02 or abs(price_deviation) <= 0.10 then 1 else 0 end as valid_price_flag
+  from dev.sandbox.pricing_measurement_raw_txn_data t1
+  -- and t2.experiment_group = 'TEST'
+  join test_expected_prices t3
+  on t1.region_name = t3.region_name
+  and t1.material_id = t3.material_id
+  and t1.ean = t3.ean
+  join pre_period t4
+  on t1.region_name = t4.region_name
+  and t1.store_id = t4.store_id 
+  and t1.ean = t4.ean
+  and t1.material_id = t4.material_id
+  where t1.period_type = 'test_period'
+  and accepted_price is not null
+)
+
+select * from test_price_validation_info
+)
+%sql
+select * 
+from test_price_validation_view
+-- where material_id = 741908
+-- AND region_name = 'DUBAI'
+%sql
+create or replace table dev.sandbox.av_store_sku_violations 
+with cte as 
+(
+select  
+v.program_name,
+v.region_name,
+v.material_id,
+mm.material_name,
+ean,
+  v.store_id,
+  sm.store_name,  sum(valid_price_flag) as valid_counts,
+  count(valid_price_flag) as total_counts,
+  round(valid_counts / total_counts,2) as valid_price_perc,
+  avg(observed_price) as avg_observed_price,
+  avg(accepted_price) as accepted_price,
+  round(avg(observed_price) - avg(accepted_price),2) as price_deviation
+from
+  test_price_validation_view v
+  join gold.store.store_master sm 
+  on sm.store_id = v.store_id
+  join gold.material.material_master mm 
+  on mm.material_id = v.material_id
+group by
+v.program_name,
+  v.store_id,
+  sm.store_name,
+  v.region_name,
+ v.material_id,
+ mm.material_name,
+ ean
+order by
+  store_id
+)
+
+select * from cte 
+%sql
+select program_name,store_id,material_id,ean,concat(store_id,material_id,ean) as store_mat_id, min(valid_price_perc) as min_valid_price_perc
+from dev.sandbox.av_store_sku_violations
+where valid_price_perc = 1
+group by program_name,store_id,material_id,ean
+%sql
+select * 
+from dev.sandbox.av_store_violations
+%sql
+create or replace table dev.sandbox.av_store_violations
+select distinct 
+--program_name,
+store_id,region_name, min(valid_price_perc) as min_valid_price_perc
+from dev.sandbox.av_store_sku_violations
+group by program_name,store_id,region_name
+having min(valid_price_perc) =1
+%sql
+create or replace table dev.sandbox.av_sku_violations
+select ss.program_name,ss.material_id,ean,concat(ss.material_id,ean) as pairs,category_name,material_group_name, min(valid_price_perc) as max_valid_price_perc
+from dev.sandbox.av_store_sku_violations ss
+join gold.material.material_master mm
+on mm.material_id =ss.material_id
+group by ss.program_name,ss.material_id,category_name,material_group_name,ean
+having min(valid_price_perc) =1
+%sql
+create or replace table dev.sandbox.av_expected_qty as 
+WITH cte AS (
+    SELECT DISTINCT 
+    program_name,
+        material_id,
+        material_name,
+        material_group_name,
+        region_name,
+        ean_final as ean
+    FROM analytics.pricing.accepted_recommendation_info_new
+)
+,
+material_store_level AS (
+    SELECT 
+    program_name,
+        pos.product_id AS material_id,
+        cte.material_group_name,
+        cte.material_name,
+        pos.store_id,
+        sm.region_name,
+        pos.ean,
+        pos.business_day,
+        SUM(pos.quantity) AS total_quantity
+    FROM gold.transaction.uae_pos_transactions pos
+    JOIN gold.store.store_master sm 
+        ON sm.store_id = pos.store_id
+    JOIN cte 
+        ON cte.material_id = pos.product_id 
+       AND cte.ean = pos.ean
+       AND cte.region_name = sm.region_name 
+    WHERE pos.business_day BETWEEN '2025-04-27' AND '2025-07-20'
+      AND pos.bulk_sale_flag IS NULL 
+      AND pos.amount > 0
+      AND pos.quantity > 0
+    GROUP BY program_name,pos.product_id, cte.material_group_name, cte.material_name, 
+             pos.store_id, sm.region_name, pos.ean, pos.business_day
+),
+
+day_level AS (
+    SELECT 
+    program_name,
+        material_id,
+        material_group_name,
+        material_name,
+        store_id,
+        region_name,
+        ean,
+        -- Daily deseasonalized avg across 84 days
+        round(SUM(total_quantity)/84,2) AS quantity_daily,
+        round(percentile_approx(total_quantity, 0.2),2) AS p20,
+        round(percentile_approx(total_quantity, 0.5),2) AS median,
+        round(percentile_approx(total_quantity, 0.9),2) AS p90,
+        round(AVG(total_quantity),2) AS mean_quantity
+    FROM material_store_level
+    GROUP BY program_name,material_id, material_group_name, material_name, store_id, region_name, ean
+),
+
+test_store_level AS (
+    SELECT 
+    program_name,
+        tt.store_id,
+        tt.material_id,
+        tt.ean,
+        tt.region_name,
+        tt.business_day,
+        SUM(tt.quantity) as actual_quantity
+    FROM test_txn_info_view tt
+    -- join gold.store.store_master sm 
+    -- on sm.store_id = tt.store_id
+    -- JOIN cte 
+    --     ON tt.material_id = cte.material_id 
+    --    AND tt.ean = cte.ean
+    --    and sm.region_name = cte.region_name
+    GROUP BY program_name,tt.store_id, tt.material_id, tt.ean, tt.region_name, tt.business_day
+)
+
+SELECT dl.*,ts.business_day,round(ts.actual_quantity,2) as actual_qty,concat(dl.store_id,dl.material_id,dl.ean) as store_mat_id
+FROM day_level dl 
+left join  test_store_level ts
+on ts.material_id = dl.material_id 
+and ts.store_id = dl.store_id 
+and ts.ean = dl.ean
+-- where dl.store_id = 2262
+-- and dl.material_id = 1075222
+-- and dl.ean = 6294011616341
+# %sql
+# create or replace table dev.sandbox.av_pl_test_price_validation_view as
+# WITH exploded_competitors AS (
+#     SELECT 
+#         mm.material_id,
+#         mm.material_name,
+#         mm.material_group_name,
+#         competitor_id
+#     FROM dev.sandbox.av_seta_competition mm
+#     LATERAL VIEW EXPLODE(ARRAY(mm.Comp1_id, mm.Comp2_id, mm.Comp3_id)) t AS competitor_id
+#     WHERE competitor_id IS NOT NULL
+# )
+# ,competitor_price as 
+# (
+# select material_id,competitor_id,store_id,material_group_name,business_day,round(sum(amount)/sum(quantity),2) as direct_cp_price
+# from gold.transaction.uae_pos_transactions pos 
+# join exploded_competitors ecc 
+# on ecc.competitor_id = pos.product_id 
+# where business_day between '2025-08-12' and current_date()
+# and amount >0
+# and bulk_sale_flag is null 
+# and quantity >0
+# group by all
+# ),
+# competitor_price_mg as 
+# (
+# select material_group_name,store_id,business_day,round(sum(amount)/sum(quantity),2) as mg_price
+# from gold.transaction.uae_pos_transactions pos 
+# join gold.material.material_master mm 
+# on mm.material_id = pos.product_id 
+# where material_group_name in (select distinct material_group_name from exploded_competitors)
+# and business_day between '2025-08-12' and current_date()
+# and (brand not ilike '%lulu%' and brand not ilike '%repacked%')
+# and amount >0
+# and bulk_sale_flag is null 
+# and quantity >0
+# group by all
+# )
+# ,test_price as 
+# (
+#   select tt.*,avg(direct_cp_price) as competiton_price,mg_price as mg_price
+#   from test_price_validation_view tt 
+#   join gold.material.material_master mm
+#   on mm.material_id = tt.material_id
+#   left join competitor_price cp 
+#   on cp.material_id = tt.material_id 
+#   and cp.store_id = tt.store_id 
+#   and cp.business_day = tt.business_day
+#   left join competitor_price_mg mg 
+#   on mm.material_group_name = mg.material_group_name 
+#   and tt.store_id = mg.store_id
+#   and tt.business_day = mg.business_day
+#   group by all
+# )
+
+# select * from test_price
+%sql
+create or replace table dev.sandbox.av_pl_test_price_validation_view
+select * from test_price_validation_view
+# %sql
+# CREATE OR REPLACE TABLE dev.sandbox.av_mg_cat_seasonality1 AS 
+# WITH mg_base AS (
+#     SELECT 
+#         sm.region_name,
+#         YEAR(pos.business_day) AS year,
+#         MONTH(pos.business_day) AS month,
+#         mm.material_group_name,
+#         mm.category_name,
+#         SUM(pos.quantity) AS quantity
+#     FROM gold.transaction.uae_pos_transactions pos
+#     JOIN gold.material.material_master mm 
+#         ON mm.material_id = pos.product_id 
+#     JOIN gold.store.store_master sm 
+#         ON sm.store_id = pos.store_id
+#     WHERE pos.business_day BETWEEN last_day(add_months(current_date, -1)) - 365*2 
+#                                AND '2025-07-31'
+#       AND (mm.brand ILIKE '%lulu%' OR mm.brand ILIKE '%repacked%')
+#       AND mm.category_name IN (
+#             SELECT DISTINCT category_name 
+#             FROM analytics.pricing.accepted_recommendation_info_new
+#       )
+#       AND pos.amount > 0
+#       AND pos.quantity > 0
+#       AND pos.bulk_sale_flag IS NULL
+#     GROUP BY sm.region_name, YEAR(pos.business_day), MONTH(pos.business_day), 
+#              mm.material_group_name, mm.category_name
+# ),
+
+# mg_monthly_by_year AS (
+#     SELECT 
+#         region_name,
+#         material_group_name,
+#         category_name,
+#         year,
+#         month,
+#         SUM(quantity) AS monthly_qty
+#     FROM mg_base
+#     GROUP BY region_name, material_group_name, category_name, year, month
+# ),
+# mg_monthly_avg AS (
+#     SELECT 
+#         region_name,
+#         material_group_name,
+#         category_name,
+#         month,
+#         AVG(monthly_qty) AS avg_monthly_qty
+#     FROM mg_monthly_by_year
+#     GROUP BY region_name, material_group_name, category_name, month
+# ),
+# mg_overall_avg AS (
+#     SELECT 
+#         region_name,
+#         material_group_name,
+#         category_name,
+#         AVG(monthly_qty) AS overall_avg_qty
+#     FROM mg_monthly_by_year
+#     GROUP BY region_name, material_group_name, category_name
+# )
+# ,cat_base as 
+# (
+#     select region_name,category_name,year,month,sum(quantity) as monthly_qty
+#     from mg_base
+#     group by region_name,category_name,year,month
+# )
+# ,cat_monthly_avg AS (
+#     SELECT 
+#         region_name,
+#         category_name,
+#         month,
+#         AVG(monthly_qty) AS avg_monthly_qty
+#     FROM cat_base
+#     GROUP BY region_name, category_name, month
+# ),
+
+# -- Overall avg qty at category level
+# cat_overall_avg AS (
+#     SELECT 
+#         region_name,
+#         category_name,
+#         AVG(monthly_qty) AS overall_avg_qty
+#     FROM cat_base
+#     GROUP BY region_name, category_name
+# )
+
+# -- Final join
+# SELECT 
+#     m.region_name,
+#     m.material_group_name,
+#     m.category_name,
+#     m.month,
+#     ROUND(m.avg_monthly_qty / NULLIF(o.overall_avg_qty,0),3) AS material_group_seasonality,
+#     ROUND(c.avg_monthly_qty / NULLIF(co.overall_avg_qty,0),3) AS category_seasonality
+# FROM mg_monthly_avg m
+# LEFT JOIN mg_overall_avg o
+#   ON m.region_name = o.region_name
+#  AND m.material_group_name = o.material_group_name
+#  AND m.category_name = o.category_name
+# LEFT JOIN cat_monthly_avg c
+#   ON m.region_name = c.region_name
+#  AND m.category_name = c.category_name
+#  AND m.month = c.month
+# LEFT JOIN cat_overall_avg co
+#   ON c.region_name = co.region_name
+#  AND c.category_name = co.category_name
+# ORDER BY m.region_name, m.material_group_name, m.category_name, m.month;
+%sql
+create or replace table dev.sandbox.am_test as
+select v.*, store_name, material_name ,concat(v.store_id,mm.material_id,ean) as store_mat_id
+from dev.sandbox.av_pl_test_price_validation_view v
+left join gold.material.material_master mm
+on mm.material_id = v.material_id
+left join gold.store.store_master sm
+on sm.store_id = v.store_id
+%sql
+create or replace table dev.sandbox.av_accepted_file
+with cte as 
+(
+select distinct program_name,material_id,region_name from dev.sandbox.am_test group by all having max(valid_price_flag) = 0
+union
+select distinct program_name,material_id,region_name from dev.sandbox.av_all_ean where accepted_price is null
+)
+
+select distinct cte.program_name,ae.material_id,ae.material_name,ae.region_name,ae.material_group_name,ae.category_name,ae.accepted_price,ae.expected_price
+from cte 
+left join  dev.sandbox.av_all_ean ae 
+on cte.material_id = ae.material_id 
+and ae.region_name = cte.region_name
+import pandas as pd
+
+# Read all sheets into a dict of DataFrames
+sheets = pd.read_excel(
+    '/Workspace/Users/811775@lulumea.com/Violations_reasons.xlsx',
+    sheet_name=None  # None = read all sheets
+)
+
+# Union all sheets into a single DataFrame
+df = pd.concat([df for df in sheets.values()], ignore_index=True)
+# df
+# Ensure datetime columns are string (handling nulls)
+df['violation_end_date'] = pd.to_datetime(df['violation_end_date'], errors='coerce').astype('string')
+df['violation_start_date'] = pd.to_datetime(df['violation_start_date'], errors='coerce').astype('string')
+
+# Convert Pandas → Spark
+spark_df = spark.createDataFrame(df)
+
+# # Write to table
+spark_df.write.mode("overwrite").option("overwriteSchema", True).saveAsTable('dev.sandbox.av_violation_reasons')
+%sql
+select * from dev.sandbox.av_violation_reasons
+%sql
+create or replace table dev.sandbox.av_violation_reasons
+select distinct r.*
+from dev.sandbox.av_violation_reasons r
+left join dev.sandbox.am_test am 
+on am.material_id = r.material_id
+left join gold.material.material_master mm 
+on mm.material_id = r.material_id
+%sql
+select * 
+from dev.sandbox.av_violation_reasons
+%sql
+create or replace table dev.sandbox.av_violation_reasons1
+WITH daily_violations AS (
+  SELECT 
+    material_id,
+    store_id,
+    material_name,
+    region_name,
+    business_day,
+    observed_price,
+    accepted_price
+  FROM dev.sandbox.am_test
+  WHERE valid_price_flag = 0
+),
+
+region_store_counts AS (
+  SELECT 
+    material_id,
+    region_name,
+    business_day,
+    COUNT(DISTINCT store_id) AS total_stores
+  FROM dev.sandbox.am_test
+  GROUP BY material_id, region_name, business_day
+),
+
+violation_store_counts AS (
+  SELECT 
+    material_id,
+    region_name,
+    business_day,
+    COUNT(DISTINCT store_id) AS violating_stores
+  FROM daily_violations
+  GROUP BY material_id, region_name, business_day
+),
+
+region_violations AS (
+  SELECT 
+    v.material_id,
+    NULL AS store_id,
+    d.material_name,
+    v.region_name,
+    v.business_day,
+    'region' AS violation_type,
+    d.observed_price,
+    d.accepted_price
+  FROM violation_store_counts v
+  JOIN region_store_counts r 
+    ON v.material_id = r.material_id 
+   AND v.region_name = r.region_name 
+   AND v.business_day = r.business_day
+  JOIN daily_violations d 
+    ON v.material_id = d.material_id 
+   AND v.region_name = d.region_name 
+   AND v.business_day = d.business_day
+  WHERE v.violating_stores = r.total_stores
+  GROUP BY v.material_id, d.material_name, v.region_name, v.business_day, d.observed_price, d.accepted_price
+),
+
+store_violations AS (
+  SELECT DISTINCT
+    d.material_id,
+    d.store_id,
+    d.material_name,
+    d.region_name,
+    d.business_day,
+    'store' AS violation_type,
+    d.observed_price,
+    d.accepted_price
+  FROM daily_violations d
+  JOIN violation_store_counts v 
+    ON d.material_id = v.material_id 
+   AND d.region_name = v.region_name 
+   AND d.business_day = v.business_day
+  JOIN region_store_counts r 
+    ON v.material_id = r.material_id 
+   AND v.region_name = r.region_name 
+   AND v.business_day = r.business_day
+  WHERE v.violating_stores < r.total_stores
+),
+
+all_violations AS (
+  SELECT * FROM region_violations
+  UNION ALL
+  SELECT * FROM store_violations
+),
+
+violation_periods AS (
+  SELECT 
+    material_id,
+    store_id,
+    material_name,
+    region_name,
+    violation_type,
+    business_day,
+    observed_price,
+    accepted_price,
+    business_day - ROW_NUMBER() OVER (
+      PARTITION BY material_id, COALESCE(store_id, region_name), violation_type 
+      ORDER BY business_day
+    ) AS grp
+  FROM all_violations
+),
+
+aggregated_periods AS (
+  SELECT 
+    material_id,
+    store_id,
+    material_name,
+    region_name,
+    violation_type,
+    MIN(business_day) AS violation_start_date,
+    MAX(business_day) AS violation_end_date,
+    AVG(observed_price) AS avg_observed_price,
+    AVG(accepted_price) AS avg_expected_price
+  FROM violation_periods
+  GROUP BY material_id, store_id, material_name, region_name, violation_type, grp
+),
+
+reason_mapping AS (
+  SELECT 
+    material_id,
+    region_name,
+    store_id,
+    Violation_start_date,
+    violation_end_date,
+    reasons 
+  FROM dev.sandbox.av_violation_reasons
+)
+
+-- ✅ Final join: map reasons where periods overlap
+SELECT 
+distinct 
+program_name,
+    v.*,
+    implementation_date,
+    r.reasons
+FROM aggregated_periods v
+LEFT JOIN reason_mapping r
+  ON v.material_id = r.material_id
+ AND COALESCE(v.store_id, -1) = COALESCE(r.store_id, -1)
+ AND v.region_name = r.region_name
+ AND (
+      -- The violation periods overlap
+      v.violation_start_date BETWEEN r.violation_start_date AND r.violation_end_date
+      or 
+      v.violation_end_date between r.violation_start_date AND r.violation_end_date
+      or
+       v.violation_end_date BETWEEN r.violation_start_date AND r.violation_end_date
+      OR 
+      (r.violation_start_date BETWEEN v.violation_start_date AND v.violation_end_date)
+    )
+left join (select program_name,material_id,region_name,min(implementation_date) as implementation_date 
+from dev.sandbox.av_all_ean
+group by all ) at 
+on at.material_id = v.material_id and at.region_name = v.region_name
+left anti join dev.sandbox.av_accepted_file imp 
+on imp.material_id = v.material_id and imp.region_name = v.region_name
+-- and imp.program_name = 'SETA Pricing August 2025'
+ORDER BY v.material_id, v.region_name, v.store_id, v.violation_start_date;
+
+%sql
+create or replace table dev.sandbox.av_store_sku_implementation
+-- select distinct store_id,material_id,store_mat_id
+-- from (
+select store_id,material_id,ean,concat(store_id,material_id,ean) as store_mat_id,avg(valid_price_perc) as min_valid_price_perc 
+from dev.sandbox.av_store_sku_violations
+group by all
+-- )
+-- group by store_id,material_id,store_mat_id
+-- having min(valid_price_perc) =1
+%sql
+create or replace table dev.sandbox.av_violation_reasons1
+select r.*,mm.material_group_name,mm.category_name
+from dev.sandbox.av_violation_reasons1 r
+join gold.material.material_master mm 
+on mm.material_id = r.material_id
+%sql
+select * from dev.sandbox.av_violation_reasons1
+%sql
+create or replace table dev.sandbox.av_export
+select * 
+from dev.sandbox.av_violation_reasons1
+where  violation_end_date > '2025-10-09'
+and reasons is  null
+%sql
+create or replace table dev.sandbox.am_store_material_info_view as
+select distinct program_name,concat(store_id,mm.material_id,ean) as store_mat_id,store_id,store_name, region_name,mm.material_id,ean,mm.material_name,mm.Category_name,mm.Material_group_name 
+from dev.sandbox.all_stores_view as
+join gold.material.material_master mm 
+on as.material_id = mm.material_id
+%sql
+create or replace table dev.sandbox.am_store_imp_info_view as
+select distinct store_id,store_name, region_name from dev.sandbox.all_stores_view
+df_glossary = pd.read_csv('/Workspace/Users/811775@lulumea.com/Pricing Master Notebook - Private label (WIP)/Glossary.csv')
+df_glossary = spark.createDataFrame(df_glossary).toDF(*[c.replace(' ', '_') for c in df_glossary.columns])
+df_glossary.write.mode("overwrite").option("mergeSchema", "true").saveAsTable("dev.sandbox.po_monitor_measurement_glossary")
+%sql
+create or replace table dev.sandbox.av_growth_store_region
+WITH pre_period_data AS (
+    SELECT 
+        sm.region_name,
+        sm.store_id,
+        mm.material_group_name,
+        mm.category_name,
+        MONTH(p.business_day) AS month,
+        SUM(p.quantity) AS total_qty_pre,
+        DATEDIFF('2025-07-20', '2025-04-27') AS pre_days
+    FROM gold.transaction.uae_pos_transactions p
+    JOIN gold.store.store_master sm 
+        ON sm.store_id = p.store_id
+    JOIN gold.material.material_master mm 
+        ON mm.material_id = p.product_id
+    WHERE p.business_day BETWEEN '2025-04-27' AND '2025-07-20'
+      AND category_name IN (
+            SELECT DISTINCT category_name 
+            FROM analytics.pricing.seta_final_recommendation
+      )
+      AND p.amount > 0
+      AND p.quantity > 0
+      AND p.bulk_sale_flag IS NULL
+    GROUP BY sm.region_name, sm.store_id, mm.material_group_name, mm.category_name, MONTH(p.business_day)
+),
+test_period_data AS (
+    SELECT 
+        sm.region_name,
+        sm.store_id,
+        mm.material_group_name,
+        mm.category_name,
+        MONTH(p.business_day) AS month,
+        SUM(p.quantity) AS total_qty_test,
+        DATEDIFF(CURRENT_DATE(), '2025-08-12') AS test_days
+    FROM gold.transaction.uae_pos_transactions p
+    JOIN gold.store.store_master sm 
+        ON sm.store_id = p.store_id
+    JOIN gold.material.material_master mm 
+        ON mm.material_id = p.product_id
+    WHERE p.business_day BETWEEN '2025-08-12' AND CURRENT_DATE()-1
+      AND p.amount > 0
+      AND p.quantity > 0
+      AND p.bulk_sale_flag IS NULL
+    GROUP BY sm.region_name, sm.store_id, mm.material_group_name, mm.category_name, MONTH(p.business_day)
+),
+deseasonalized_pre_period AS (
+    SELECT 
+        pre.region_name,
+        pre.store_id,
+        pre.material_group_name,
+        pre.category_name,
+        pre.month,
+        pre.total_qty_pre,
+        pre.pre_days,
+        ROUND(pre.total_qty_pre / NULLIF(m.material_group_seasonality, 0), 2) AS deseasonalized_qty_pre
+    FROM pre_period_data pre
+    JOIN dev.sandbox.av_mg_cat_seasonality1 m
+      ON pre.region_name = m.region_name
+     AND pre.material_group_name = m.material_group_name
+     AND pre.category_name = m.category_name
+     AND pre.month = m.month
+),
+deseasonalized_test_period AS (
+    SELECT 
+        test.region_name,
+        test.store_id,
+        test.material_group_name,
+        test.category_name,
+        test.month,
+        test.total_qty_test,
+        test.test_days,
+        ROUND(test.total_qty_test / NULLIF(m.material_group_seasonality, 0), 2) AS deseasonalized_qty_test
+    FROM test_period_data test
+    JOIN dev.sandbox.av_mg_cat_seasonality1 m
+      ON test.region_name = m.region_name
+     AND test.material_group_name = m.material_group_name
+     AND test.category_name = m.category_name
+     AND test.month = m.month
+),
+pre_day_deseasonalized AS (
+  SELECT 
+      region_name,
+      store_id,
+      material_group_name,
+      category_name,
+      SUM(deseasonalized_qty_pre) / MAX(pre_days) AS pre_per_day
+  FROM deseasonalized_pre_period
+  GROUP BY region_name, store_id, material_group_name, category_name
+),
+test_day_deseasonalized AS (
+  SELECT 
+      region_name,
+      store_id,
+      material_group_name,
+      category_name,
+      SUM(deseasonalized_qty_test) / MAX(test_days) AS test_per_day
+  FROM deseasonalized_test_period
+  GROUP BY region_name, store_id, material_group_name, category_name
+),
+-- Store + Material Group level growth
+mg_growth AS (
+  SELECT 
+      a.store_id,
+      a.region_name,
+      a.category_name,
+      a.material_group_name,
+      ROUND((b.test_per_day - a.pre_per_day) / NULLIF(a.pre_per_day,0),4) AS mg_growth_store
+  FROM pre_day_deseasonalized a
+  LEFT JOIN test_day_deseasonalized b
+    ON a.region_name = b.region_name
+   AND a.store_id = b.store_id 
+   AND a.material_group_name = b.material_group_name
+   AND a.category_name = b.category_name
+),
+-- Store + Category level growth (aggregate across material groups)
+cat_growth AS (
+  SELECT 
+      a.store_id,
+      a.region_name,
+      a.category_name,
+      ROUND(
+        (SUM(b.test_per_day) - SUM(a.pre_per_day)) / NULLIF(SUM(a.pre_per_day),0),
+        4
+      ) AS cat_growth_store
+  FROM pre_day_deseasonalized a
+  LEFT JOIN test_day_deseasonalized b
+    ON a.region_name = b.region_name
+   AND a.store_id = b.store_id 
+   AND a.material_group_name = b.material_group_name
+   AND a.category_name = b.category_name
+  GROUP BY a.store_id, a.region_name, a.category_name
+),
+-- Region + Material Group level growth
+region_mg_growth AS (
+  SELECT 
+      a.region_name,
+      a.category_name,
+      a.material_group_name,
+      ROUND(
+        (SUM(b.test_per_day) - SUM(a.pre_per_day)) / NULLIF(SUM(a.pre_per_day),0),
+        4
+      ) AS mg_growth_region
+  FROM pre_day_deseasonalized a
+  LEFT JOIN test_day_deseasonalized b
+    ON a.region_name = b.region_name
+   AND a.store_id = b.store_id 
+   AND a.material_group_name = b.material_group_name
+   AND a.category_name = b.category_name
+  GROUP BY a.region_name, a.category_name, a.material_group_name
+),
+-- Region + Category level growth (aggregate across material groups and stores)
+region_cat_growth AS (
+  SELECT 
+      a.region_name,
+      a.category_name,
+      ROUND(
+        (SUM(b.test_per_day) - SUM(a.pre_per_day)) / NULLIF(SUM(a.pre_per_day),0),
+        4
+      ) AS cat_growth_region
+  FROM pre_day_deseasonalized a
+  LEFT JOIN test_day_deseasonalized b
+    ON a.region_name = b.region_name
+   AND a.store_id = b.store_id 
+   AND a.material_group_name = b.material_group_name
+   AND a.category_name = b.category_name
+  GROUP BY a.region_name, a.category_name
+)
+
+-- Final Output: store growth + region growth
+SELECT 
+    m.store_id,
+    m.region_name,
+    m.category_name,
+    m.material_group_name,
+    m.mg_growth_store,
+    c.cat_growth_store,
+    rm.mg_growth_region,
+    rc.cat_growth_region
+FROM mg_growth m
+JOIN cat_growth c
+  ON m.store_id = c.store_id
+ AND m.region_name = c.region_name
+ AND m.category_name = c.category_name
+JOIN region_mg_growth rm
+  ON m.region_name = rm.region_name
+ AND m.category_name = rm.category_name
+ AND m.material_group_name = rm.material_group_name
+JOIN region_cat_growth rc
+  ON m.region_name = rc.region_name
+ AND m.category_name = rc.category_name
+%sql
+select * 
+from dev.sandbox.av_all_ean 
+where material_name ilike '%basmati%'
+%sql
+select business_day,round(sum(amount)/sum(quantity),2) as price,sum(quantity) as qty
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id 
+where business_day between '2025-04-20' and current_Date
+and ean in (select distinct ean_final from dev.sandbox.av_all_ean where material_id = 1263969)
+and product_id = 1263969
+and region_name = 'DUBAI'
+group by all 
+%sql
+select * 
+from dev.sandbox.all_violation_df
+%sql
+select * 
+from analytics.pricing.accepted_recommendation_info_new1
+%sql
+select distinct business_day,round(avg(regular_unit_price),2) as regular_unit_price ,round(sum(amount)/sum(quantity),2) as price
+from gold.transaction.uae_pos_transactions pos 
+join gold.material.material_master mm 
+on mm.material_id = pos.product_id 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-08-14' and '2025-11-12'
+and pos.store_id = 2050 
+and product_id = 411985
+group by all
+%sql
+select * 
+from dev.sandbox.av_pre_txn_info
+where store_id = 2310 
+and region_name = 'SHARJAH'
+and  material_id = 411985
+%sql
+WITH mg_seasonality AS (
+    SELECT DISTINCT 
+        region_name,
+        material_group_name,
+        month,
+        material_group_seasonality
+    FROM dev.sandbox.av_mg_cat_seasonality1
+),
+raw_data_with_seasonality AS (
+    SELECT 
+        rt.program_name,
+        rt.period_type,
+        rt.material_group_name,
+        rt.category_name,
+        rt.region_name,
+        rt.store_id,
+        rt.material_id,
+        rt.business_day,
+        day_type,
+        rt.ean,
+        rt.num_txn,
+        rt.total_qty,
+        rt.total_qty / NULLIF(ms.material_group_seasonality,0) AS deseason_qty,
+        rt.total_sales,
+        af.valid_non_pay_days,
+        af.valid_pay_days,
+        rt.avg_regular_unit_price,
+        ms.material_group_seasonality
+    FROM dev.sandbox.pricing_measurement_raw_txn_data1 rt
+    JOIN mg_seasonality ms 
+      ON ms.material_group_name = rt.material_group_name
+     AND ms.region_name = rt.region_name
+     AND ms.month = MONTH(rt.business_day)
+    join  dev.sandbox.av_promo_tag_days af
+    on af.material_id = rt.material_id
+    and af.Region_name = rt.region_name
+    and af.period_type = rt.period_type
+    WHERE rt.period_type = 'pre_period'
+)
+
+
+select min(business_day),max(),count(distinct business_day) as cnt,sum(total_qty)
+from raw_data_with_seasonality
+where material_id = 411985
+and region_name = 'SHARJAH'
+and store_id =  2310 
+group by all
+%sql
+SELECT 
+    COUNT(DISTINCT pos.business_day) AS total_days,
+    SUM(COALESCE(pos.quantity,0)) AS total_qty
+FROM gold.transaction.uae_pos_transactions pos
+JOIN (
+        SELECT DISTINCT business_day
+        FROM dev.sandbox.pricing_measurement_raw_txn_data1
+        WHERE material_id = 411985
+          AND region_name = 'SHARJAH'
+          AND store_id = 2310
+     ) d
+  ON pos.business_day = d.business_day
+JOIN (
+        SELECT DISTINCT ean_final
+        FROM dev.sandbox.av_all_ean
+     ) e
+  ON pos.ean = e.ean_final
+WHERE pos.store_id = 2310
+  AND pos.product_id = 411985
+  AND pos.amount > 0
+  AND pos.bulk_sale_flag IS NULL
+;
+
+%sql
+WITH valid_products AS (
+    SELECT DISTINCT 
+        material_id product_id, 
+        region_name,
+        ean_final
+    FROM dev.sandbox.av_all_ean
+    WHERE accepted_price IS NOT NULL
+),
+
+store_price AS (
+    SELECT
+        business_day,
+        sm.region_name,
+        pos.store_id,
+        pos.product_id,
+        SUM(amount) AS total_sales,
+        SUM(quantity) AS total_qty,
+        SUM(amount) / SUM(quantity) AS store_price
+    FROM gold.transaction.uae_pos_transactions pos
+    JOIN gold.store.store_master sm 
+        ON sm.store_id = pos.store_id
+    JOIN valid_products vp 
+        ON vp.product_id = pos.product_id
+       AND vp.region_name = sm.region_name
+    WHERE business_day BETWEEN '2025-08-28' AND '2025-11-26'
+    and ean in (select distinct ean_final from dev.sandbox.av_all_ean)
+      AND amount > 0
+      AND quantity > 0
+    GROUP BY business_day, sm.region_name, pos.store_id, pos.product_id
+),
+
+region_price AS (
+    SELECT
+        business_day,
+        region_name,
+        product_id,
+        SUM(total_sales) / SUM(total_qty) AS region_avg_price
+    FROM store_price
+    GROUP BY business_day, region_name, product_id
+),
+
+comparison AS (
+    SELECT
+        sp.business_day,
+        sp.region_name,
+        sp.product_id,
+        sp.store_id,
+        CASE
+            WHEN sp.store_price BETWEEN rp.region_avg_price * 0.95
+                                   AND rp.region_avg_price * 1.05
+            THEN 0
+            ELSE 1
+        END AS violation_flag
+    FROM store_price sp
+    JOIN region_price rp
+      ON sp.business_day = rp.business_day
+     AND sp.region_name = rp.region_name
+     AND sp.product_id = rp.product_id
+),
+
+store_violation AS (
+    SELECT
+        region_name,
+        product_id,
+        store_id,
+        MAX(violation_flag) AS store_violation
+    FROM comparison
+    GROUP BY region_name, product_id, store_id
+)
+
+SELECT
+    region_name,
+    product_id,
+    SUM(store_violation) AS stores_outside_5pct,
+    COUNT(*) AS total_stores,
+    ROUND(SUM(store_violation) / COUNT(*), 4) AS violation_ratio
+FROM store_violation
+GROUP BY region_name, product_id
+ORDER BY product_id, region_name;
+%sql
+select pos.store_id,business_day,sum()
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-08-28' AND '2025-11-26'
+and region_name = 'AL AIN'
+and product_id = 868438
+group by all

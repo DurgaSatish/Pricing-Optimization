@@ -1,0 +1,1321 @@
+import numpy as np
+import pandas as pd
+import ast
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
+import optuna
+from sklearn.inspection import partial_dependence
+from sklearn.preprocessing import MinMaxScaler
+pd.set_option('display.max_columns', None)
+
+import itertools
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+
+import pyspark.sql.functions as F
+import traceback
+
+import sys
+import os
+# stderr = sys.stderr
+# sys.stderr = open(os.devnull, 'w')
+# Give the table name of the modelling dataset and table for cartesian features
+
+material_group = 'DISPSBL.VINYL GLOVES'
+
+# *************************************        MASTER TABLES     ***********************************
+
+final_mds_table = f'dev.sandbox.sd_pl_mds_weekly_mg'
+feature_table = f'dev.sandbox.sd_pl_feature_sets_master'
+prepared_data_table = f'dev.sandbox.sd_pl_prepared_data_master'
+best_params_tb = f'dev.sandbox.sd_pl_best_params_master'
+
+final_iterations_tb = f'dev.sandbox.sd_pl_final_iterations_master'
+final_preds_tb = f'dev.sandbox.sd_pl_final_preds_master'
+final_model_results = f'dev.sandbox.sd_pl_model_results_master'
+
+
+# *************************************        SEPAFRATE TABLES INITIAL MGs   ***********************************
+# final_mds_table = f'dev.sandbox.sd_mds_weekly_pl_{material_group}'
+# feature_table = f'dev.sandbox.av_feature_sets_{material_group}'
+# prepared_data_table = f'dev.sandbox.av_prepared_data_{material_group}'
+# best_params_tb = f'dev.sandbox.sd_best_params_pl_{material_group}'
+
+# final_iterations_tb = f'dev.sandbox.sd_pl_final_iterations_{material_group}'
+# final_preds_tb = f'dev.sandbox.sd_pl_final_preds_{material_group}'
+# final_model_results = f'dev.sandbox.sd_pl_model_results_{material_group}'
+
+
+print(final_mds_table,"\n",feature_table,"\n",prepared_data_table)
+
+# spark.sql(f'select * from {final_mds_table}').display()
+spark.sql(f'desc {final_mds_table}').display()
+# Initialize the variables required for the model and other functions
+# This will be used to create a cartesian product to find the best feature in a set for the model
+
+material_identifiers = ['week_number','model_name','material_group_name','category_name','region_name']
+# x_price = ['per_vol_price','comp_per_price_ratio'] 
+x_price = ['per_vol_price'] 
+y_quantity = ['total_volume']
+# x_lag_quantity = ['lag_quantity_2w']
+# x_quantity_ma = ['MA_4W_QTY']
+# x_competitors = ['comp_total_discount','lag_competition_discount','lag_num_promo_events','lagged_total_discount'] 
+
+x_competitors = ['lag_num_promo_events','lagged_total_discount'] 
+x_other_var = ['num_distr_ratio','has_holidays','total_discount_ratio','is_ramadan_flag','pay_days'] #'total_rainfall','max_temperature'
+seasonality = ['seasonality_2w_ma','seasonality_3w_ma','seasonality_4w_ma' , 'seasonality_idx']
+x_promo = ['num_promo_events','total_event_days','num_promo_events_on_weekend']
+import itertools
+import pandas as pd
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+# Fix the seasonality list
+seasonality = ['seasonality_idx', 'seasonality_3w_ma', 'seasonality_4w_ma','seasonality_2w_ma']
+
+feature_sets = {}
+results_data = []
+
+for price,seas in itertools.product(x_price, seasonality):
+    key = f"price={price} + seasonality={seas}"
+    feature_list = (
+        [price]           # Single price feature             
+      + [seas]            # Single seasonality feature
+      + y_quantity        # All quantity features
+      + x_competitors     # Competitor features
+      + x_other_var       # Other features
+      + x_promo           # Promo features
+    )
+    
+    feature_sets[key] = feature_list
+    
+    results_data.append({
+        'price_column': price,
+        'seasonality_column': seas,
+        'all_features': ','.join(feature_list),
+        'feature_set_name': key
+    })
+
+results_df = pd.DataFrame(results_data)
+print(f"Generated {len(feature_sets)} feature‐sets.\n")
+
+results_df['material_group'] = material_group
+# Convert Pandas DataFrame to Spark DataFrame
+spark_results_df = spark.createDataFrame(results_df)
+
+# Write Spark DataFrame to table
+# spark_results_df.write.mode('overwrite').option('overwriteSchema',True).saveAsTable(f'{feature_table}')
+spark_results_df.write.mode('append').option('mergeSchema',True).saveAsTable(feature_table)
+display(spark_results_df)
+spark.sql(f"select * from {final_mds_table} where material_group_name = '{material_group}'").display()
+# base_data = spark.table(f"{final_mds_table}") 
+base_data = spark.sql(f"select * from {final_mds_table} where material_group_name = '{material_group}' and week_number != '2025-W44'") 
+# Create the consolidated dataset with dynamic column selection
+all_datasets = []
+
+for config in results_data:
+    feature_set_name = config['feature_set_name']
+    price_col = config['price_column']
+    seasonality = config['seasonality_column']
+    
+    # Base columns
+    base_columns = ['week_number','model_name','region_name','material_group_name','category_name']
+    
+    # Select base columns and constant features
+    constant_features = y_quantity + x_competitors + x_other_var + x_promo
+    
+    # Create dataset with renamed columns for the varying features
+    feature_set_data = base_data.select(
+        *base_columns,
+        F.col(price_col).alias('price'),      # Rename specific price column to 'price'
+        F.col(seasonality).alias('seasonality'),         # Rename specific ma column to 'ma'
+        *constant_features                      # All other features remain as is
+    ).withColumn('feature_set_name', F.lit(feature_set_name)) \
+     .withColumn('price_column_used', F.lit(price_col)) \
+     .withColumn('seasonality_used',F.lit(seasonality))
+    
+    all_datasets.append(feature_set_data)
+
+# Union all datasets - they all have the same schema now
+final_dataset = all_datasets[0]
+for ds in all_datasets[1:]:
+    final_dataset = final_dataset.unionAll(ds)
+display(
+    final_dataset
+    .groupBy('feature_set_name')
+    .agg(
+        F.count('*').alias('row_count'),
+        F.countDistinct('week_number').alias('unique_weeks'),
+        F.countDistinct('region_name').alias('unique_regions'),
+        # F.countDistinct('material_id').alias('unique_materials'),
+        F.min('week_number').alias('min_week'),
+        F.max('week_number').alias('max_week')
+    )
+    .orderBy('row_count', ascending=False)
+)
+from sklearn.ensemble import RandomForestRegressor, AdaBoostRegressor
+from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
+from sklearn.linear_model import LinearRegression, ElasticNet
+
+def get_model(name, params):
+    """
+    Returns a regression model based on the given name and parameters.
+    
+    Args:
+        name (str): Name of the model (e.g., 'RandomForestRegressor', 'LogLinear', etc.).
+        params (dict): Parameters to pass to the model.
+
+    Returns:
+        model (object): Initialized regression model or 'None' if the name is invalid.
+    """
+
+    if name == 'RandomForestRegressor':
+        model = RandomForestRegressor(random_state=42, **params)
+    elif name == 'AdaBoostRegressor':
+        model = AdaBoostRegressor(random_state=42, **params)
+    elif name == 'CatBoostRegressor':
+        model = CatBoostRegressor(verbose=0, random_state=42, **params)
+    elif name == 'XGBRegressor':
+        model = XGBRegressor(random_state=42, **params)
+    elif name in ('LogLinear', 'LogLogLinear', 'LinearLog', 'LinearRegression'):
+        model = LinearRegression(**params)
+    elif name == 'ElasticNet':
+        model = ElasticNet(random_state=42, **params)
+    else:
+        model = None 
+
+    return model
+def model_data_prep(data,model_filter=None, 
+                   group_columns=['region_name', 'material_group_name','feature_set_name', 'model_name']):
+    """
+    Prepares data for modeling by:
+    1. Filtering for specific model if provided
+    2. Preserving grouping columns (region, week, model_name)
+    3. Dropping other unnecessary identifier columns
+    4. Normalizing specified numerical columns within each group
+    5. Removing columns with constant values within groups
+
+    Args:
+        data (pd.DataFrame): The input dataset
+        x_other_var (list): List of numerical columns to normalize
+        model_filter (str or list): Specific category(ies) to filter for. If None, uses all model
+        group_columns (list): Columns to group by for fitting models
+
+    Returns:
+        pd.DataFrame: The transformed dataset ready for modeling
+    """
+    
+    # Filter by category if specified
+    if model_filter is not None:
+        if isinstance(model_filter, str):
+            data = data[data['model_name'] == model_filter].copy()
+            print(f"Filtered data for category: {model_filter}")
+        elif isinstance(model_filter, list):
+            data = data[data['model_name'].isin(model_filter)].copy()
+            print(f"Filtered data for model: {model_filter}")
+        
+        if len(data) == 0:
+            raise ValueError(f"No data found for model filter: {model_filter}")
+        
+        print(f"Data shape after model filter: {data.shape}")
+    
+    # Separate group columns from the data
+    group_data = data[group_columns].copy()
+    
+    # Define columns to drop (excluding the group columns we want to keep)
+    identifier_columns_to_drop = ['material_group_name','category_name',
+                                  'price_column_used', 'quantity_column_used', 'seasonality_used']
+    
+    # Remove group columns from the drop list to avoid dropping them
+    identifier_columns_to_drop = [col for col in identifier_columns_to_drop 
+                                  if col not in group_columns]
+    
+    # Get feature columns (everything except group columns and columns to drop)
+    feature_columns = [col for col in data.columns 
+                      if col not in group_columns and col not in identifier_columns_to_drop]
+    
+    # Create feature data
+    feature_data = data[feature_columns].copy()
+    
+    # Normalize numerical columns within each group
+    normalize_feature = x_other_var + x_competitors  +['seasonality']
+    columns_to_normalize = [col for col in normalize_feature if col in feature_columns]
+    print(columns_to_normalize)
+    print("Available feature columns:", feature_columns)
+    data_normalized = pd.concat([group_data, feature_data], axis=1)
+    
+
+    final_data = []
+    
+    for feature_set, fs_data in data_normalized.groupby('feature_set_name'):
+        # Find non-constant columns for this feature set
+        non_constant_mask = (fs_data != fs_data.iloc[0]).any()
+        
+        # Always keep group columns even if they're constant within a group
+        for col in group_columns:
+            if col in non_constant_mask.index:
+                non_constant_mask[col] = True
+        
+        # Get non-constant columns
+        columns_to_keep = non_constant_mask[non_constant_mask].index.tolist()
+        
+        # Report removed columns
+        constant_columns = set(fs_data.columns) - set(columns_to_keep)
+        if constant_columns:
+            print(f"Feature set '{feature_set}' - Removed constant columns: {list(constant_columns)}")
+        
+        # Keep only non-constant columns
+        fs_data_cleaned = fs_data[columns_to_keep]
+        final_data.append(fs_data_cleaned)
+    
+    # Combine all feature sets
+    result = pd.concat(final_data, ignore_index=True)
+    
+    # Ensure all group columns are present in the final result
+    for col in group_columns:
+        if col not in result.columns:
+            result[col] = data[col]
+    result = result.reset_index(drop=True)
+    return result
+data=final_dataset.toPandas()
+data
+# spark.sql(f"select distinct model_name from {final_mds_table} where material_group_name = '{material_group}'").display()
+model_filter_list = spark.sql(f"select distinct model_name from {final_mds_table} where material_group_name = '{material_group}'").toPandas()["model_name"].tolist()
+
+model_filter_list
+prepared_data = model_data_prep(
+    data=final_dataset.toPandas(),
+    # model_filter= ['LULU ANTISEPTIC']
+    # model_filter= ['LULU INSTANT COFFEE','G/F LATTE COFFEE 3IN1']
+    # model_filter= ['LULU HIMA.PINK SALT POUCH','LULU HIMA.PINK SALT JAR']
+    model_filter = model_filter_list
+)
+prepared_data.sort_values(
+    by=['feature_set_name', 'model_name', 'region_name', 'week_number']
+).head(5)
+
+prepared_data['comp_total_discount'] = 0
+prepared_data['comp_total_discount'] = prepared_data['comp_total_discount'].astype(float)
+prepared_data['lag_competition_discount'] = 0
+prepared_data['lag_competition_discount'] = prepared_data['lag_competition_discount'].astype(float)
+
+spark_df_prepare = spark.createDataFrame(prepared_data)
+spark_df_prepare.write.mode('append').option('mergeSchema',True).saveAsTable(prepared_data_table)
+spark_df_prepare.display()
+# filtered_data = spark.table(prepared_data_table).toPandas()
+filtered_data = spark.sql(f"select * from {prepared_data_table} where material_group_name = '{material_group}'").toPandas()
+# filtered_data = filtered_data.fillna({'comp_total_discount': 0, 'lag_competition_discount': 0})
+filtered_data['model_name'].unique()
+def get_params_range(trial, name):
+    if name == 'RandomForestRegressor':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 20),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 20),
+            'max_features': trial.suggest_categorical('max_features', [1.0, 'sqrt', 'log2']),
+            'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+        }
+        if params['bootstrap']:
+            params['oob_score'] = trial.suggest_categorical('oob_score', [True, False])
+        else:
+            params['oob_score'] = False  # Force False if no bootstrapping
+
+    elif name == 'AdaBoostRegressor':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 1.0, log=True),
+            'loss': trial.suggest_categorical('loss', ['linear', 'square', 'exponential'])
+        }
+
+    elif name == 'CatBoostRegressor':
+        params = {
+            'iterations': trial.suggest_int('iterations', 100, 1000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 1.0, log=True),
+            'depth': trial.suggest_int('depth', 4, 16),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-2, 10.0, log=True),
+            'bagging_temperature': trial.suggest_float('bagging_temperature', 0.0, 1.0),
+            'border_count': trial.suggest_int('border_count', 32, 255),
+            'random_strength': trial.suggest_float('random_strength', 0.0, 10.0),
+            'grow_policy': trial.suggest_categorical('grow_policy', ['SymmetricTree', 'Depthwise', 'Lossguide']),
+        }
+
+    elif name == 'XGBRegressor':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.1, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 1.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 1.0, log=True),
+        }
+    elif name == 'ElasticNet':
+        params = {
+            'alpha': trial.suggest_float('alpha', 1e-4, 10.0, log=True),
+            'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),
+            'fit_intercept': trial.suggest_categorical('fit_intercept', [True, False]),
+            'max_iter': trial.suggest_int('max_iter', 500, 5000),
+        }
+    elif name in ['LinearRegression', 'LogLinear', 'LinearLog', 'LogLogLinear']:
+        params = {
+            'fit_intercept': trial.suggest_categorical('fit_intercept', [True, False]),
+        }
+    else:
+        params = 'None'
+    
+    return params
+def optuning(df_mds, df_region_sku_sampled,test_size,name,n_trials):
+    """
+    Optimize hyperparameters for a given model using Optuna.
+    
+    Args:
+        df_mds: Full dataset
+        df_region_sku_sampled: Sampled region-material combinations
+        name: Model name (e.g., 'RandomForestRegressor')
+    
+    Returns:
+        DataFrame with averaged best hyperparameters
+    """
+    
+    best_params_df = pd.DataFrame()
+    successful_combos = 0
+    failed_combos = 0
+    
+    for i in range(len(df_region_sku_sampled)):
+        try:
+            df_mds_optuna = df_region_sku_sampled.iloc[i:i+1].copy()
+            df_mds_optuna = df_mds_optuna.merge(
+                df_mds, 
+                on=['region_name', 'model_name'], 
+                how='left'
+            )
+            if len(df_mds_optuna) < 10:
+                failed_combos += 1
+                continue
+                
+            columns_to_drop = ['quantity', 'week', 'week_number', 'region_name', 'model_name', 
+                              'feature_set_name', 'category_name','total_volume',
+                              'material_group_name', 'price_column_used', 'quantity_column_used', 
+                              ]
+            
+            X = df_mds_optuna.drop(columns=[col for col in columns_to_drop if col in df_mds_optuna.columns])
+            X = X.select_dtypes(include=[np.number])
+            
+            # Skip if no numeric features
+            if X.shape[1] == 0:
+                print(f"  No numeric features found for combination {i+1}")
+                failed_combos += 1
+                continue
+            
+            y = df_mds_optuna['total_volume']
+            
+            # Train-test split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42,shuffle = True)
+            print(X_train.columns)
+            normalize_features = x_other_var + x_competitors + ['seasonality']
+            scaler = MinMaxScaler()
+            X_train_scaled = X_train.copy()
+            X_train_scaled[normalize_features] = scaler.fit_transform(X_train[normalize_features])
+
+            # Apply the same scaler to test data
+            X_test_scaled = X_test.copy()
+            X_test_scaled[normalize_features] = scaler.transform(X_test[normalize_features])
+            
+            def objective(trial):
+                try:
+                    params = get_params_range(trial, name)
+                    # if name == 'Linear':
+                    #     X_train_scaled = X_train.copy()
+                    #     y_train = y_train.copy()
+
+                    # if name == 'LogLinear':        # ln(Y) = β0 + β1 X
+                    #     X_train_scaled = X_train.copy()
+                    #     y_train = np.log1p(y_train)
+
+                    # elif name == 'LinearLog':        # Y = β0 + β1 ln(X)
+                    #     X_train_scaled = np.log1p(X_train)
+                    #     y_train = y_train.copy()
+
+                    # elif name == 'LogLogLinear':     # ln(Y) = β0 + β1 ln(X)
+                    #     X_train_scaled = np.log1p(X_train)
+                    #     y_train = np.log1p(y_train)
+
+                    if params == 'None':
+                        return -999
+                        
+                    model = get_model(name, params)
+                    model.fit(X_train_scaled, y_train)
+                    y_pred = model.predict(X_test_scaled)
+                    score = r2_score(y_test, y_pred)
+                    print(f"Trial {trial.number}: R2 = {score:.4f}")
+                    return score
+                except Exception as e:
+                    return -999
+            
+            # Create and run Optuna study
+            study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+            optuna.logging.set_verbosity(optuna.logging.CRITICAL)
+            study.optimize(objective, n_trials=n_trials)
+            
+            # Store best parameters if optimization was successful
+            if study.best_value > -999:
+                temp = pd.DataFrame([study.best_params])
+                best_params_df = pd.concat([best_params_df, temp], ignore_index=True)
+                successful_combos += 1
+            else:
+                failed_combos += 1
+                
+        except Exception as e:
+            print(f"  Error processing combination {i+1}: {str(e)}")
+            failed_combos += 1
+            continue
+    
+    print(f"  Processed {successful_combos} combinations successfully, {failed_combos} failed")
+    
+    # Average parameters across all samples
+    if len(best_params_df) == 0:
+        print("  WARNING: No successful parameter optimization. Returning empty parameters.")
+        return pd.DataFrame({'model': [name], 'hyperparameters': ['{}']})
+    
+    # Define parameter types for averaging
+    int_cols = ['min_data_in_leaf', 'bagging_freq', 'iterations', 'border_count', 
+                'n_estimators', 'min_samples_split', 'min_samples_leaf', 'num_leaves', 
+                'max_depth', 'depth']
+    float_cols = ['learning_rate', 'lambda_l1', 'lambda_l2', 'feature_fraction', 
+                  'bagging_fraction', 'subsample', 'l2_leaf_reg', 'bagging_temperature', 
+                  'random_strength', 'gamma', 'reg_alpha', 'reg_lambda', 'colsample_bytree']
+    text_cols = ['max_features', 'loss', 'grow_policy', 'bootstrap', 'oob_score']
+    
+    params_avg = {}
+    
+    for col in best_params_df.columns:
+        if np.issubdtype(best_params_df[col].dtype, np.integer):
+            params_avg[col] = int(round(best_params_df[col].mean()))
+        elif np.issubdtype(best_params_df[col].dtype, np.floating):
+            params_avg[col] = best_params_df[col].mean()
+        else:  # object / categorical
+            params_avg[col] = best_params_df[col].mode()[0]
+    
+    # Return as DataFrame
+    params_avg_df = pd.DataFrame({'model': [name], 'hyperparameters': [str(params_avg)]})
+    
+    return params_avg_df
+
+def sample_data_for_tuning(df, random_state=42):
+    """
+    For each model_id, randomly sample one (region_name, feature_set_name) combination.
+
+    Returns:
+        List of DataFrames (one for each sampled combination)
+    """
+    np.random.seed(random_state)
+
+    sampled_data_list = []
+
+    unique_combos = df[['model_name', 'region_name', 'feature_set_name']].drop_duplicates()
+
+    # Sample one combination per model_name
+    for model in unique_combos['model_name'].unique():
+        model_combos = unique_combos[unique_combos['model_name'] == model]
+        if not model_combos.empty:
+            sampled_combo = model_combos.sample(1, random_state=random_state).iloc[0]
+
+            # Filter full data for the sampled combo
+            combo_df = df[
+                (df['model_name'] == sampled_combo['model_name']) &
+                (df['region_name'] == sampled_combo['region_name']) &
+                (df['feature_set_name'] == sampled_combo['feature_set_name'])
+            ].copy()
+
+            if not combo_df.empty:
+                print(f"Sampled for model_name: {model} -> region: {sampled_combo['region_name']}, feature_set: {sampled_combo['feature_set_name']}")
+                sampled_data_list.append(combo_df)
+
+    return sampled_data_list
+def find_best_hyperparameters(df, model_names, n_trials,test_size):
+    """
+    Find best hyperparameters by sampling data and running Optuna optimization.
+
+    Args:
+        df: Prepared dataset (Pandas DataFrame)
+        model_names: List of model names to tune (e.g., ['RandomForestRegressor'])
+        n_trials: Number of Optuna trials per combination
+
+    Returns:
+        DataFrame with best hyperparameters for each model
+    """
+    # Step 1: Sample one (model_name, feature_set_name) per region
+    sampled_data_list = sample_data_for_tuning(df, random_state=42)
+    # print(sampled_data_list)
+
+    # Step 2: Extract metadata from sampled combos
+    metadata = []
+    for combo_df in sampled_data_list:
+        if combo_df.empty:
+            continue  # Skip empty combos
+        row = combo_df.iloc[0]
+        metadata.append({
+            'region_name': row['region_name'],
+            'model_name': row['model_name'],
+            'feature_set_name':row['feature_set_name']
+        })
+
+    df_sampled_metadata = pd.DataFrame(metadata)
+
+    # Step 3: Combine sampled data into one dataframe
+    df_sampled_combined = pd.concat(sampled_data_list, ignore_index=True)
+
+    # Step 4: Initialize result container
+    tuned_hyperparameters = pd.DataFrame()
+
+    # Step 5: Tune each model
+    for model_name in model_names:
+        print(f"\nTuning {model_name}...")
+
+        try:
+            result = optuning(
+                df_mds=df_sampled_combined,
+                df_region_sku_sampled=df_sampled_metadata,
+                test_size= test_size,
+                name=model_name,
+                n_trials=n_trials
+            )
+
+            tuned_hyperparameters = pd.concat([tuned_hyperparameters, result], ignore_index=True)
+            print(f"{model_name} done")
+
+        except Exception as e:
+            print(f"Error tuning {model_name}: {e}")
+
+    return tuned_hyperparameters
+filtered_data.columns
+filtered_data['total_discount_ratio'].fillna(0, inplace=True) 
+filtered_data['model_name'].unique()
+filtered_data.head()
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+
+# --- Select relevant columns ---
+# cols = ['week_number', 'price', 'seasonality', 'total_volume',
+#         'comp_total_discount', 'lag_competition_discount',
+#         'lag_num_promo_events', 'lagged_total_discount', 'num_distr_ratio',
+#         'has_holidays', 'total_discount_ratio', 'is_ramadan_flag',
+#         'pay_days', 'num_promo_events', 'total_event_days',
+#         'num_promo_events_on_weekend']
+
+cols = ['week_number', 'price', 'seasonality', 'total_volume',
+        'lag_num_promo_events', 'lagged_total_discount', 'num_distr_ratio',
+        'has_holidays', 'total_discount_ratio', 'is_ramadan_flag',
+        'pay_days', 'num_promo_events', 'total_event_days',
+        'num_promo_events_on_weekend']
+
+# df = filtered_data[(filtered_data['feature_set_name'] == 'price=per_vol_price+seasonality=seasonality_idx')&(filtered_data['region_name'] == 'ABU DHABI')&(filtered_data['model_name'] == 'CUREFORM TOILET AIRFRSHNR')]
+
+df = filtered_data[(filtered_data['feature_set_name'] == 'price=per_vol_price+seasonality=seasonality_idx')&(filtered_data['region_name'] == 'DUBAI')]
+
+df = filtered_data[cols].copy()
+df = df.sort_values(by='week_number')
+
+# --- Split features and target ---
+X = df.drop(columns=['total_volume', 'week_number'])
+y = df['total_volume']
+
+# --- Train-test split ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.30, random_state=42, shuffle=False
+)
+
+# If above shuffle = False gives better results then update the shuffle = False in Optuning (for temporal split or test train data)
+
+# --- Train model ---
+model = RandomForestRegressor(random_state=42)
+model.fit(X_train, y_train)
+
+# --- Predictions and evaluation ---
+y_pred = model.predict(X_test)
+print("R2 Score:", round(r2_score(y_test, y_pred), 3))
+print("RMSE:", round(np.sqrt(mean_squared_error(y_test, y_pred)), 3))
+
+# --- SHAP explanation ---
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+
+# --- SHAP summary plot (global feature importance) ---
+shap.summary_plot(shap_values, X_test, plot_type="bar")
+plt.show()
+
+# --- SHAP beeswarm plot (distribution of feature effects) ---
+shap.summary_plot(shap_values, X_test)
+plt.show()
+
+# --- SHAP for single prediction (local explanation) ---
+# pick one observation from the test set, e.g., the first one
+shap.initjs()
+shap.force_plot(explainer.expected_value, shap_values[0, :], X_test.iloc[0, :])
+
+# --- Filter region and subset columns ---
+df = filtered_data[filtered_data['region_name'] == 'ABU DHABI'][cols].copy()
+df = df.sort_values(by='week_number')
+
+# --- Correlation Matrix ---
+corr = df.corr(numeric_only=True)
+print("\n--- Correlation Matrix ---")
+print(corr['total_volume'].sort_values(ascending=False))
+
+# --- Correlation Heatmap ---
+plt.figure(figsize=(12, 8))
+sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", cbar=True)
+plt.title("Feature Correlation Matrix")
+plt.show()
+
+filtered_data.info()
+models = ['RandomForestRegressor','AdaBoostRegressor' ,'LogLinear','LogLogLinear', 'LinearLog', 'LinearRegression','CatBoostRegressor', 'XGBRegressor','ElasticNet'] #
+# models = ['LogLinear', 'LogLogLinear', 'LinearLog', 'LinearRegression'] 
+best_params = find_best_hyperparameters(
+    df=filtered_data,
+    model_names=models,
+    test_size = 0.30,
+    n_trials=100
+)
+best_params
+from pyspark.sql import Row
+best_params['material_group'] = material_group
+spark_df = spark.createDataFrame(best_params)
+# spark_df.display()
+spark_df.write.mode("append").option("mergeSchema", "true").saveAsTable(best_params_tb)
+spark.sql(f"select * from {best_params_tb} where material_group = '{material_group}'").display()
+# best_params = spark.table('dev.sandbox.av_best_params').toPandas()
+# best_params = spark.table(best_params_tb).toPandas()
+
+best_params = spark.sql(f"select * from {best_params_tb} where material_group = '{material_group}'").toPandas()
+# def calculate_elasticities(model, X, method='pdp', price_col='price', discount_col='total_discount_ratio'):
+#     valid_methods = ['pdp', 'marginal']
+
+#     if method not in valid_methods:
+#         raise ValueError(f"Invalid method. Choose from {valid_methods}")
+
+#     if price_col not in X.columns:
+#         raise ValueError(f"{price_col} not found in the dataset")
+
+#     elasticities = {'price_elasticity': None, 'promo_elasticity': None}
+
+#     if method == 'pdp':
+#         if price_col in X.columns:
+#             pdp_price = partial_dependence(model, X, [X.columns.get_loc(price_col)], grid_resolution=100)
+#             prices, quantities = pdp_price['values'][0], pdp_price['average'][0]
+            
+#             price_changes = np.gradient(prices)
+#             quantity_changes = np.gradient(quantities)
+#             price_elasticities = np.divide(quantity_changes / quantities, price_changes / prices, 
+#                                         out=np.zeros_like(quantity_changes), where=price_changes != 0)
+#             elasticities['price_elasticity'] = np.round(np.mean(price_elasticities),3)
+#             # print(prices[:5])
+#             # print(quantities[:5])
+#             # print(price_changes[:5])
+#             # print(quantity_changes[:5])
+
+#         else:
+#             elasticities['price_elasticity'] = None
+        
+#         if discount_col in X.columns:
+#             X_discount = X[X[discount_col] != 0].copy()
+#             X_discount = X_discount[X_discount[discount_col] != X_discount[discount_col].shift()]
+#             if len(X_discount) > 0 and X_discount[discount_col].nunique() >= 5:
+#                 pdp_discount = partial_dependence(model, X_discount, [X_discount.columns.get_loc(discount_col)], grid_resolution=100)
+#                 discounts, quantities = pdp_discount['values'][0], pdp_discount['average'][0]
+                
+#                 discount_changes = np.gradient(discounts)
+#                 quantity_changes = np.gradient(quantities)
+#                 discount_elasticities = np.divide(quantity_changes / quantities, discount_changes / discounts, 
+#                 out=np.zeros_like(quantity_changes), where=discount_changes != 0)
+#                 elasticities['promo_elasticity'] = np.round(np.mean(discount_elasticities),3)
+#             else:
+#                 elasticities['promo_elasticity'] = None
+#         else:
+#             elasticities['promo_elasticity'] = None
+
+#     elif method == 'marginal':
+#         if price_col in X.columns:
+#             y_pred = model.predict(X)
+#             delta_price = X[price_col].std() * 0.01
+#             X_plus_delta = X.copy()
+#             X_plus_delta[price_col] += delta_price
+#             price_elasticity = np.mean((model.predict(X_plus_delta) - y_pred) / y_pred / (delta_price / X[price_col]))
+#             elasticities['price_elasticity'] = np.round(price_elasticity,3)
+#         else:
+#             elasticities['price_elasticity'] = None
+        
+#         if discount_col in X.columns:
+#             X_discount = X[X[discount_col] != 0].copy()
+#             X_discount = X_discount[X_discount[discount_col] != X_discount[discount_col].shift()]
+            
+#             if len(X_discount) > 0 and X_discount[discount_col].nunique() >= 5:
+#                 y_pred_discount = model.predict(X_discount)
+#                 delta_discount = X_discount[discount_col].std() * 0.01
+#                 X_discount_plus_delta = X_discount.copy()
+#                 X_discount_plus_delta[discount_col] += delta_discount
+#                 promo_elasticity = np.mean((model.predict(X_discount_plus_delta) - y_pred_discount) / y_pred_discount / (delta_discount / X_discount[discount_col]))
+#                 elasticities['promo_elasticity'] = np.round(promo_elasticity,3)
+#             else:
+#                 elasticities['promo_elasticity'] = None
+#         else:
+#             elasticities['promo_elasticity'] = None
+    
+#     return elasticities
+def calculate_elasticities(model, X, method='pdp', price_col='price', discount_col='total_discount_ratio'):
+    valid_methods = ['pdp', 'marginal']
+
+    if method not in valid_methods:
+        raise ValueError(f"Invalid method. Choose from {valid_methods}")
+
+    if price_col not in X.columns:
+        raise ValueError(f"{price_col} not found in the dataset")
+
+    elasticities = {'price_elasticity': None, 'promo_elasticity': None}
+
+    if method == 'pdp':
+        if price_col in X.columns:
+            pdp_price = partial_dependence(model, X, [X.columns.get_loc(price_col)], grid_resolution=100)
+            prices, quantities = pdp_price['values'][0], pdp_price['average'][0]
+            
+            price_changes = np.gradient(prices)
+            quantity_changes = np.gradient(quantities)
+            price_elasticities = np.divide(quantity_changes / quantities, price_changes / prices, 
+                                        out=np.zeros_like(quantity_changes), where=price_changes != 0)
+            elasticities['price_elasticity'] = np.round(np.mean(price_elasticities),3)
+        else:
+            elasticities['price_elasticity'] = None
+    
+    return elasticities
+def results_calculate(results, df):
+    results = pd.merge(results, df[['model_name', 'category_name','feature_name_set']].drop_duplicates(), on = 'material_id', how = 'left')
+
+    results['acceptable_model_flag'] = np.where((results.r2_test >= 0.6) & (results.price_elasticity < 0), 1, 0)
+
+    results = results.drop(columns = 'r2_train')
+    results.rename(columns = {'r2_test': 'r2'}, inplace = True)
+    
+    return results
+def feature_importances(name, model, X_train):
+    """
+    Returns a dictionary of feature importances for various model types.
+
+    Args:
+        name (str): Model name.
+        model: Trained model object.
+        X_train (pd.DataFrame): Training data features.
+
+    Returns:
+        dict: Sorted dictionary of feature importances.
+    """
+    features = X_train.columns.tolist()
+
+    # if name in ['LinearRegression', 'LogLinear', 'LogLogLinear']:
+    #     importances = model.coef_
+    if name in ['LinearRegression','LogLinear', 'LogLogLinear', 'LinearLog', 'LinearRegression']:
+        importances = model.coef_
+    elif name == 'CatBoostRegressor':
+        importances = model.get_feature_importance()
+    elif name in ['RandomForestRegressor', 'XGBRegressor', 'AdaBoostRegressor']:
+        importances = model.feature_importances_
+    else:
+        importances = np.zeros(len(features))  # Default case
+
+    # Flatten if needed (e.g. if importances is 2D)
+    if isinstance(importances, np.ndarray) and importances.ndim > 1:
+        importances = importances[0]
+
+    # Map feature names to absolute importances
+    importance_dct = {feature: abs(imp) for feature, imp in zip(features, importances)}
+    importance_dct = dict(sorted(importance_dct.items(), key=lambda item: item[1], reverse=True))
+
+    return importance_dct
+# from sklearn.linear_model import ElasticNet
+# from sklearn.model_selection import GridSearchCV
+# import json
+# def model_testing(df, test_size, params_df, grid_search=False):
+
+#     models = {
+#         'LinearRegression': LinearRegression(),
+#         'LogLogLinear': LinearRegression(),
+#         'RandomForestRegressor': RandomForestRegressor(random_state=42),
+#         'AdaBoostRegressor': AdaBoostRegressor(random_state=42),
+#         'ElasticNet': ElasticNet(random_state=42)
+#     }
+
+#     param_grids = {
+#         'RandomForestRegressor': {
+#             'n_estimators': [100, 200, 300],
+#             'max_depth': [None, 10, 20],
+#             'min_samples_split': [2, 5, 10],
+#             'min_samples_leaf': [1, 2, 4]
+#         },
+#         'AdaBoostRegressor': {
+#             'n_estimators': [50, 100, 200],
+#             'learning_rate': [0.01, 0.1, 0.5]
+#         },
+#         'ElasticNet': {
+#             'alpha': [0.01, 0.1, 1.0, 10.0],
+#             'l1_ratio': [0.1, 0.5, 0.9],
+#             'fit_intercept': [True, False],
+#             'max_iter': [500, 1000, 2000]
+#         }
+#     }
+    
+
+#     results = []
+
+#     combinations = df.groupby(['region_name', 'model_name', 'feature_set_name']).size().reset_index()[['region_name', 'model_name', 'feature_set_name']]
+#     # print(combinations)
+
+#     for _, combo in combinations.iterrows():
+#         region = combo['region_name']
+#         material = combo['model_name']
+#         feature_set = combo['feature_set_name']
+
+#         df2 = df[(df['region_name'] == region) &
+#                  (df['model_name'] == material) &
+#                  (df['feature_set_name'] == feature_set)].reset_index(drop=True)
+
+#         if 'total_volume' not in df2.columns or len(df2) < 2:
+#             continue
+
+#         columns_to_drop = ['region_name', 'model_name', 'feature_set_name', 'category_name', 'material_name',
+#                            'material_group_name', 'price_column_used', 'total_volume_column_used',
+#                            'lag_column_used', 'ma_column_used','total_volume']
+#         X = df2.drop(columns=[c for c in columns_to_drop if c in df2.columns])
+#         X = X.select_dtypes(include=[np.number])
+#         y = df2['total_volume']
+
+#         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
+
+#         for name, model in models.items():
+#             X_train_model = X_train.copy()
+#             X_test_model = X_test.copy()
+#             y_train_model = y_train.copy()
+#             y_test_model = y_test.copy()
+
+#             # Optional: scaling for parametric models
+#             if name in ['LinearRegression', 'LogLogLinear', 'ElasticNet']:
+#                 from sklearn.preprocessing import MinMaxScaler
+#                 scaler_X = MinMaxScaler()
+#                 X_train_model = scaler_X.fit_transform(X_train_model)
+#                 X_test_model = scaler_X.transform(X_test_model)
+#                 if name == 'ElasticNet':
+#                     # Optionally scale y
+#                     scaler_y = MinMaxScaler()
+#                     y_train_model = scaler_y.fit_transform(y_train_model.values.reshape(-1, 1)).flatten()
+#                     y_test_model = scaler_y.transform(y_test_model.values.reshape(-1, 1)).flatten()
+
+#             # Apply GridSearchCV if enabled
+#             if grid_search and name in param_grids:
+#                 grid = GridSearchCV(model, param_grids[name], cv=3, scoring='r2', n_jobs=-1)
+#                 grid.fit(X_train_model, y_train_model)
+#                 best_model = grid.best_estimator_
+#                 best_params = grid.best_params_
+#             else:
+#                 model.fit(X_train_model, y_train_model)
+#                 best_model = model
+#                 best_params = model.get_params()
+
+#             y_pred = best_model.predict(X_test_model)
+#             from sklearn.metrics import r2_score, mean_squared_error
+#             r2 = r2_score(y_test_model, y_pred)
+#             rmse = mean_squared_error(y_test_model, y_pred, squared=False)
+#             feat_importance = feature_importances(name, best_model, X_train)
+
+#             results.append({
+#                 'region': region,
+#                 'model': name,
+#                 'r2_test': r2,
+#                 'rmse_test': rmse,
+#                 'hyperparameters': best_params,
+#                 'feature_importance': feat_importance
+#             })
+#             df_ = pd.DataFrame(results)
+
+#             # Convert dict columns to JSON strings
+#             df_['hyperparameters'] = df_['hyperparameters'].apply(lambda x: json.dumps(x))
+#             df_['feature_importance'] = df_['feature_importance'].apply(lambda x: json.dumps(x))
+
+#     return df_
+
+def model_testing(df, test_size, params_df):
+
+    models = {
+        'LinearRegression': LinearRegression(),
+       'LogLinear': LinearRegression(),
+        'LogLogLinear': LinearRegression(),
+       'RandomForestRegressor': RandomForestRegressor(random_state=42),
+        'AdaBoostRegressor': AdaBoostRegressor(random_state=42),
+       'XGBRegressor': XGBRegressor(random_state=42),
+      'CatBoostRegressor': CatBoostRegressor(verbose=0, random_state=42),
+      'ElasticNet': ElasticNet(random_state=42)
+    }
+
+    if not params_df.empty:
+        for name in models:
+            params_row = params_df[params_df['model'] == name]
+            if len(params_row) > 0:
+                best_params = ast.literal_eval(params_row['hyperparameters'].iloc[0])
+                if best_params:
+                    models[name].set_params(**best_params)
+
+    # results = pd.DataFrame(columns=['region_name', 'model_name', 'feature_set_name', 'model', 'r2_train', 'r2_test', 'rmse', 'price_elasticity', 'promo_elasticity', 'feature_importance'])
+    results = pd.DataFrame(columns=['region_name', 'model_name', 'feature_set_name', 'model', 'r2_train', 'r2_test', 'rmse', 'price_elasticity','feature_importance'])
+
+    scatter_plot_df = pd.DataFrame()
+    full_pred_df = pd.DataFrame()
+
+    combinations = df.groupby(['region_name', 'model_name', 'feature_set_name']).size().reset_index()[['region_name', 'model_name', 'feature_set_name']]
+    columns_to_drop = ['region_name', 'model_name', 'feature_set_name', 'category_name', 'material_group_name', 'price_column_used', 'lag_column_used']
+
+    for _, combo in combinations.iterrows():
+        region = combo['region_name']
+        material = combo['model_name']
+        feature_set = combo['feature_set_name']
+
+        df2 = df[(df['region_name'] == region) & (df['model_name'] == material) & (df['feature_set_name'] == feature_set)].reset_index(drop=True)
+
+        week_column = df2['week_number'].values if 'week_number' in df2.columns else None
+        cols_to_drop = [col for col in columns_to_drop if col in df2.columns]
+        df2_numeric = df2.drop(columns=cols_to_drop)
+        numeric_cols = df2_numeric.select_dtypes(include=[np.number]).columns.tolist()  # <-- .tolist() makes it a list
+
+        # Ensure week is included
+        columns_to_keep = numeric_cols + (['week_number'] if 'week_number' in df2_numeric.columns else [])
+
+        # Now select these columns
+        df2_final = df2_numeric[columns_to_keep]
+
+        # Sort by week
+        df2_final = df2_final.sort_values(by='week_number', ascending=True).reset_index(drop=True)
+
+
+        # numeric_cols = df2_numeric.select_dtypes(include=[np.number]).columns.tolist()
+        # df2_final = df2_numeric[numeric_cols] + ['week'] if 'week' in df2_numeric.columns else numeric_cols
+        print(df2_final.columns)
+
+        X = df2_final.drop(columns='total_volume') #.sort_values(by='week_number', ascending=True)
+        print(X.columns)
+        y = df2_final['total_volume']
+        # y = np.log1p(df2_final['total_volume'])
+        # print("X shape:", X.shape)
+        # print("y shape:", y.shape)
+
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=True)
+        # split_index = int(0.7 * len(X))
+
+        # X_train = X.iloc[:split_index]
+        # X_test = X.iloc[split_index:]
+
+        # y_train = y.iloc[:split_index]
+        # y_test = y.iloc[split_index:]
+
+
+        if 'week_number' in X_train.columns:
+            weeks_train = X_train['week_number'].tolist()
+            weeks_test = X_test['week_number'].tolist()
+            X_train = X_train.drop(columns='week_number')
+            X_test = X_test.drop(columns='week_number')
+        else:
+            weeks_train = [None] * len(X_train)
+            weeks_test = [None] * len(X_test)
+
+
+        price_cols = [col for col in X_train.columns if 'price' in col.lower()]
+        price_col = price_cols[0] if price_cols else X_train.columns[0]
+        print(f"Running models for Model: {model_name}, Region: {region}, Feature Set: {feature_set}")
+
+        for name, model in models.items():
+            try:
+                X_train_model = X_train.copy()
+                X_test_model = X_test.copy()
+                y_train_model = y_train.copy()
+                y_test_model = y_test.copy()
+
+                # For parametric models apply scaling
+                if name in ['LinearRegression', 'LogLinear']:
+                    scaler_X = MinMaxScaler()
+                    scaler_y = MinMaxScaler()
+                    X_train_model = pd.DataFrame(scaler_X.fit_transform(X_train_model), columns=X_train.columns)
+                    X_test_model = pd.DataFrame(scaler_X.transform(X_test_model), columns=X_test.columns)
+                    y_train_model = scaler_y.fit_transform(y_train_model.values.reshape(-1, 1)).flatten()
+                    y_test_model = scaler_y.transform(y_test_model.values.reshape(-1, 1)).flatten()
+
+                    if name == 'LogLinear':
+                        y_train_model = np.log1p(np.maximum(y_train_model, 0))
+                        y_test_model = np.log1p(np.maximum(y_test_model, 0))
+
+                elif name == 'LogLogLinear':
+                    y_train_model = np.log1p(np.maximum(y_train_model, 0))
+                    y_test_model = np.log1p(np.maximum(y_test_model, 0))
+                    X_train_model = np.log1p(np.maximum(X_train_model, 0))
+                    X_test_model = np.log1p(np.maximum(X_test_model, 0))
+
+                model.fit(X_train_model, y_train_model)
+                y_train_pred = model.predict(X_train_model)
+                y_test_pred = model.predict(X_test_model)
+
+                if name in ['LinearRegression', 'LogLinear', 'LogLogLinear']:
+                    if name in ['LogLinear', 'LogLogLinear']:
+                        y_train_pred = np.expm1(y_train_pred)
+                        y_test_pred = np.expm1(y_test_pred)
+                    if name in ['LinearRegression', 'LogLinear']:
+                        y_train_pred = scaler_y.inverse_transform(y_train_pred.reshape(-1, 1)).flatten()
+                        y_test_pred = scaler_y.inverse_transform(y_test_pred.reshape(-1, 1)).flatten()
+
+                    y_train_for_score = y_train
+                    y_test_for_score = y_test
+                else:
+                    y_train_for_score = y_train_model
+                    y_test_for_score = y_test_model
+
+                train_score = r2_score(y_train_for_score, y_train_pred)
+                test_score = r2_score(y_test_for_score, y_test_pred)
+                rmse = np.sqrt(mean_squared_error(y_test_for_score, y_test_pred))
+
+                elasticities = calculate_elasticities(model, X_train)
+                price_elasticity = elasticities.get('price_elasticity', 0)
+                # promo_elasticity = elasticities.get('promo_elasticity', 0)
+                # print(promo_elasticity)
+
+                importance_dct = feature_importances(name, model, X_train)
+
+                # results.loc[len(results)] = [region, material, feature_set, name, train_score, test_score, rmse, price_elasticity, promo_elasticity, importance_dct]
+                results.loc[len(results)] = [region, material, feature_set, name, train_score, test_score, rmse, price_elasticity, importance_dct]
+
+                combined_len = len(y_train_for_score) + len(y_test_for_score)
+                # print(f"\n--- Debug info for {name} ---")
+                # print(f"len(y_train_for_score): {len(y_train_for_score)}")
+                # print(f"len(y_test_for_score): {len(y_test_for_score)}")
+                # print(f"len(y_train_pred): {len(y_train_pred)}")
+                # print(f"len(y_test_pred): {len(y_test_pred)}")
+                # print(f"len(price): {len(X_train[price_col].tolist() + X_test[price_col].tolist())}")
+                # print(f"len(total_volume_actual): {len(y_train.tolist() + y_test.tolist())}")
+                # print(f"len(week): {len(weeks_train + weeks_test)}")
+
+
+                temp = pd.DataFrame({
+                    'model': [name] * combined_len,
+                    'model_set': ['train'] * len(y_train_for_score) + ['test'] * len(y_test_for_score),
+                    'region_name': [region] * combined_len,
+                    'model_name': [material] * combined_len,
+                    'feature_set_name': [feature_set] * combined_len,
+                    'price': X_train[price_col].tolist() + X_test[price_col].tolist(),
+                    'total_volume_actual': y_train.tolist() + y_test.tolist(),
+                    'total_volume_pred': y_train_pred.tolist() + y_test_pred.tolist(),
+                    'week': weeks_train + weeks_test
+                })
+
+                scatter_plot_df = pd.concat([scatter_plot_df, temp], ignore_index=True)
+
+            except Exception as e:
+                print(f"Error with {name}: {e}")
+                continue
+
+    results[['r2_train', 'r2_test']] = round(results[['r2_train', 'r2_test']], 3)
+    return scatter_plot_df, results
+
+filtered_data.groupby(['model_name', 'region_name', 'feature_set_name']).count()
+from pyspark.sql.functions import current_timestamp
+from pyspark.sql import SparkSession
+
+# Start or get Spark session
+spark = SparkSession.builder.getOrCreate()
+
+# Get unique material_ids from filtered_data (Pandas)
+model_names_to_run = filtered_data['model_name'].dropna().unique().tolist()
+
+# Optional holders to store all results
+all_results = []
+all_scatter_plots = []
+
+# Loop through each model with progress tracking
+for idx, model_name in enumerate(model_names_to_run, start=1):
+    print(f"\nRunning for model_name: {model_name} ({idx}/{len(model_names_to_run)})")
+    
+    # Subset data for the current model_name
+    subset_data = filtered_data[filtered_data['model_name'] == model_name].copy()
+
+    # Run the model
+    scatter_plot_df, results = model_testing(df=subset_data, params_df=best_params, test_size=0.30)
+
+    # Convert to Spark and save if not empty
+    if not results.empty:
+        spark_results = spark.createDataFrame(results).withColumn("ingestion_ts", current_timestamp())
+        # spark_results.write.mode("append").saveAsTable("dev.sandbox.av_overall_final_iterations4")
+        # spark_results.write.mode("append").saveAsTable("dev.sandbox.sd_pl_final_iterations_tea_bags1")
+        spark_results.write.mode("append").option("mergeSchema", "true").saveAsTable(final_iterations_tb)
+
+    if not scatter_plot_df.empty:
+        spark_scatter = spark.createDataFrame(scatter_plot_df).withColumn("ingestion_ts", current_timestamp())
+        # spark_scatter.write.mode("append").saveAsTable("dev.sandbox.av_overall_final_iterations_preds4")
+        # spark_scatter.write.mode("append").saveAsTable("dev.sandbox.sd_pl_final_preds_tea_bags1")
+        spark_scatter.write.mode("append").option("mergeSchema","true").saveAsTable(final_preds_tb)
+
+    # Append to in-memory holders (optional)
+    all_results.append(results)
+    all_scatter_plots.append(scatter_plot_df)
+
+    print(f"Completed {idx} of {len(model_names_to_run)} models.\n")
+spark.sql(f"""
+select 
+*
+-- from dev.sandbox.sd_pl_final_iterations_tea_bags1
+from {final_iterations_tb}
+where model_name in ({', '.join([repr(x) for x in model_filter_list])})
+
+"""
+).display()
+
+
+spark.sql(f"""
+select 
+    *
+-- from dev.sandbox.sd_pl_final_iterations_tea_bags1
+from {final_preds_tb}
+where model_name in ({', '.join([repr(x) for x in model_filter_list])})
+"""
+).display()
+
+
+final_model_res = spark.sql(f"""
+-- create or replace table {final_model_results} as
+
+with cte as 
+(
+SELECT
+    mr.model_name,
+    -- mr.material_group_name,
+    mr.region_name,
+    mr.model as ml_model,
+    feature_set_name,
+    r2_train,
+    round(r2_test,3) as r2,
+    price_elasticity,
+    Round(rmse,2) as rmse,
+    mr.feature_importance,
+    -- pm.hyperparameters,
+    True as temporal_split_shuffle
+FROM {final_iterations_tb} mr
+WHERE
+    1 = 1
+    -- and comment = 'temporal split'
+    and r2_train >= 0.7 and r2_train <= 0.97 
+    --and ROUND(r2_test,1) >= 0.6
+    and r2_test >= 0.6
+    and r2_test <= r2_train
+    and (r2_train - r2_test) < 0.4
+    AND price_elasticity < 0
+    and  feature_set_name not ilike '%comp_per_price_%'
+    -- and mr.model_name in ('LULU HIMA.PINK SALT JAR','LULU HIMA.PINK SALT POUCH')
+    and mr.model_name in ({', '.join([repr(x) for x in model_filter_list])})
+)
+,cte2 as 
+(
+select *
+from cte
+qualify row_number() over (partition by model_name, region_name order by r2 desc) = 1
+)
+,intermediate as 
+(
+select cte2.* except(feature_set_name,ml_model),pred.* except(model_name,region_name,price,total_volume_Actual),mds.* except(model_name,region_name,week_number),pm.hyperparameters
+from cte2 
+join {final_preds_tb} pred
+on cte2.model_name = pred.model_name 
+    and cte2.region_name = pred.region_name
+    and cte2.feature_set_name = pred.feature_set_name
+    and cte2.ml_model = pred.model
+join {final_mds_table} mds
+on mds.model_name = pred.model_name 
+    and mds.region_name = pred.region_name
+    and mds.week_number = pred.week
+left join {best_params_tb} pm
+on cte2.ml_model = pm.model
+AND mds.material_group_name = pm.material_group 
+-- where pred.model_name in ('LULU HIMA.PINK SALT JAR','LULU HIMA.PINK SALT POUCH')
+where pred.model_name in ({', '.join([repr(x) for x in model_filter_list])})
+)
+
+select * except(ingestion_ts), max(ingestion_ts) as max_ingestion_ts
+from intermediate
+group by all
+
+""")
+
+final_model_res.write.mode("append").option("mergeSchema", "true").saveAsTable(final_model_results)
+final_model_res.display()
+
+spark.sql(f"""
+          
+select 
+    *
+from {final_model_results}
+
+
+""").display()
+spark.sql(f"""
+select 
+    region_name,
+    model_name,
+    feature_set_name,
+    model
+from {final_iterations_tb}
+GROUP BY 
+    region_name,
+    model_name,
+    feature_set_name,
+    model
+HAVING COUNT(*) > 1
+"""
+).display()
+spark.sql(f"""
+select 
+    region_name,
+    model_name,
+    feature_set_name,
+    model,
+    week
+from {final_preds_tb}
+GROUP BY 
+    region_name,
+    model_name,
+    feature_set_name,
+    model,
+    week
+HAVING COUNT(*) > 1
+"""
+).display()
+spark.sql(f"""
+select 
+    region_name,
+    model_name,
+    week
+from {final_model_results}
+GROUP BY 
+    region_name,
+    model_name,
+    week
+HAVING COUNT(*) > 1
+"""
+).display()

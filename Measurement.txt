@@ -1,0 +1,2675 @@
+%md
+## Summary
+
+This notebook helps in removing the preperiod promotion i.e if holidays and, promotions greater than 8%. Remove the business_day - region level from the pre period days. This measures the store level pre-period vs post-period qty, removes the stores with no sales on pre period or test period. then aggregateon region level and measure the impact. Take Map from stock_details table as cogs and calculate margin
+%md
+# Imports
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+import numpy as np
+import pandas as pd
+
+import re
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from datetime import datetime, timedelta
+import warnings
+# recommended_table = 'analytics.pricing.seta_final_recommendation'
+# Accepted_table = 'dev.sandbox.av_all_ean'#'dev.sandbox.av_accepted_file'
+# program_name = 'SETA Pricing August 2025'
+# Final_table = 'analytics.pricing.seta_accepted_recommendation_info_new'# 'analytics.pricing.seta_accepted_recommendation_info'
+recommended_table_seta = 'analytics.pricing.seta_final_recommendation'
+recommended_table_setb = 'analytics.pricing.setb_final_recommendation'
+Accepted_table = 'dev.sandbox.av_all_ean'#'dev.sandbox.av_accepted_file'
+Final_table = 'analytics.pricing.accepted_recommendation_info_new'# 'analytics.pricing.seta_accepted_recommendation_info'
+%sql
+select * from analytics.pricing.seta_final_recommendation
+df = spark.table(f'{Accepted_table}')
+%sql
+select * from dev.sandbox.av_all_ean where accepted_price is not null
+df.display()
+from pyspark.sql import functions as F
+from datetime import datetime, timedelta
+
+# current_date cutoff (1 day prior to today)
+current_date = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+start_date_pre = '2025-04-20'
+
+# baseline = 12 weeks = 84 days
+BASELINE_NUM_DAYS = 104
+
+df_spark = (
+    df
+    # Parse dd.MM.yyyy -> date type
+    # .withColumn("implementation_final", F.to_date("implementation_final", "dd.MM.yyyy"))
+    
+    # Compute end_date = implementation_date + 90 days
+    .withColumn("end_date", F.date_add(F.col("implementation_final"), 90))
+    
+    # Apply current_date cutoff for final_end_date
+    .withColumn("final_end_date", F.least(F.col("end_date"), F.to_date(F.lit(current_date), "yyyy-MM-dd")))
+    
+    # Compute number of implementation days
+    .withColumn(
+        "num_implementation_days",
+        F.datediff(F.col("final_end_date"), F.col("implementation_final")) + F.lit(1)
+    )
+    
+    # ---- PRE PERIOD CALCULATIONS ----
+    # Start date of pre-period = 12 weeks before implementation
+   .withColumn('start_date_pre', F.lit(f'{start_date_pre}'))
+    
+    # End date of pre-period (aligned to implementation duration)
+    .withColumn("end_date_pre", F.expr("date_add(start_date_pre, num_implementation_days - 1)"))
+    
+    # End date of overall pre-period baseline (full 84 days)
+    .withColumn("end_date_pre_overall", F.date_add(F.col("start_date_pre"), BASELINE_NUM_DAYS))
+    
+    # Equivalent pre-period length (in days)
+    .withColumn("num_equivalent_days", F.datediff(F.col("end_date_pre"), F.col("start_date_pre")) + F.lit(1))
+    
+    # Standardize dates into yyyy-MM-dd (optional)
+    .withColumn("implementation_final", F.date_format("implementation_final", "yyyy-MM-dd"))
+    .withColumn("end_date", F.date_format("end_date", "yyyy-MM-dd"))
+    .withColumn("final_end_date", F.date_format("final_end_date", "yyyy-MM-dd"))
+    .withColumn("start_date_pre", F.date_format("start_date_pre", "yyyy-MM-dd"))
+    .withColumn("end_date_pre", F.date_format("end_date_pre", "yyyy-MM-dd"))
+    .withColumn("end_date_pre_overall", F.date_format("end_date_pre_overall", "yyyy-MM-dd"))
+)
+
+df_spark.display()
+
+df_spark.write.option('overwriteSchema',True).mode('overwrite').saveAsTable(f'{Final_table}')
+%sql
+select * from analytics.pricing.seta_accepted_recommendation_info_new
+%md
+# Txn Details
+%md
+## Pre-Implementation Period (input data)
+# implementation period txn
+pre_txn_query_string = f"""
+with hhc_txn_data_raw_AUH as (
+select
+at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'ABU DHABI'
+),
+hhc_txn_data_raw_DXB as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'DUBAI'
+--and upper(t3.store_format) in ('HYPERMARKET')
+),
+hhc_txn_data_raw_shj as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'SHARJAH'
+)
+,hhc_txn_data_raw_alain as (
+    select
+    at.program_name,
+t2.material_group_name,
+t1.business_day,
+case when t1.business_day <= at.end_date_pre then 'test_equivalent' else 'other_period' end as period_sub_type,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.start_date_pre)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.start_date_pre and t1.business_day <= at.end_date_pre_overall
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and upper(t3.region_name)  = 'AL AIN'
+and bulk_sale_flag is null
+--and upper(t3.store_format) in ('HYPERMARKET')
+)
+
+
+
+select *
+from hhc_txn_data_raw_AUH
+union
+select * 
+from hhc_txn_data_raw_DXB
+union
+select *
+from hhc_txn_data_raw_alain
+union
+select * 
+from hhc_txn_data_raw_shj
+"""
+
+
+df_pre_txn_info =  spark.sql(pre_txn_query_string)
+df_pre_txn_info.createOrReplaceTempView("pre_txn_info_view")
+df_pre_txn_info.display()
+%md
+## Implementation Period
+# implementation period txn
+test_txn_query_string = f"""
+with implementation_dubai as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'DUBAI'
+)
+,implementation_auh as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'ABU DHABI'
+)
+,implementation_shj as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'SHARJAH'
+)
+,implementation_alain as (
+select
+  at.program_name,
+t2.material_group_name,
+t1.business_day,
+date_format(t1.business_day, 'yyyyMM') AS year_month,
+floor(datediff(t1.business_day, at.implementation_final)/7) + 1 as week_number,
+t1.transaction_id,
+t1.customer_id,
+t1.product_id as material_id,
+t1.ean as ean,
+t1.amount,
+t1.quantity,
+t1.unit_price,
+t1.regular_unit_price,
+t3.region_name,
+t3.store_format,
+t1.store_id,
+t2.category_name
+from gold.transaction.uae_pos_transactions t1
+join gold.store.store_master t3
+on t1.store_id = t3.store_id
+join gold.material.material_master t2
+on t1.product_id = t2.material_id
+join {Final_table} at 
+on at.material_id = t1.product_id 
+and at.ean_final = t1.ean 
+and at.region_name = t3.region_name
+and  t1.business_day >= at.implementation_final and t1.business_day <= at.final_end_date
+and t1.amount > 0 and t1.quantity > 0 and upper(t1.transaction_type) in ('SALE','SELL_MEDIA')
+and bulk_sale_flag is  null
+and at.region_name = 'AL AIN'
+)
+
+select *
+from implementation_dubai
+union
+select * 
+from implementation_auh
+union
+select * 
+from implementation_shj
+union
+select * from implementation_alain
+"""
+
+
+df_test_txn_info =  spark.sql(test_txn_query_string)
+df_test_txn_info.createOrReplaceTempView("test_txn_info_view")
+df_test_txn_info.display()
+%md
+# Merged Master Data
+- test_txn_info_view (test period txn data)
+- pre_txn_info_view (pre-test period txn data)
+%md
+## pre and test txn data view
+%sql
+
+-- this view contains the 'pre' and 'test' period merged 'daily aggregated' txn data for all stores and
+-- all SKUs in the region_list and mg_list and not just test SKUs and experiment stores
+-- filtering for test SKUs and experiment stores will be done later when needed
+
+create or replace temp view daily_agg_txn_info_merged_view as (
+
+with test_period_daily_aggregates as (
+  select
+  program_name,
+  'test_period' as period_type,
+  'test' as period_sub_type,
+  material_group_name,
+  category_name,
+  region_name,
+  store_id,
+  material_id,
+  ean,
+  business_day,
+  case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as day_type,
+  week_number,
+  count(distinct transaction_id) as num_txn,
+  sum(quantity) as total_qty,
+  sum(amount) as total_sales,
+  avg(unit_price) as avg_unit_price,
+  avg(regular_unit_price) as avg_regular_unit_price
+  from test_txn_info_view
+  group by material_group_name, region_name, store_id, material_id,ean, business_day, week_number,program_name,category_name
+),
+
+pre_period_daily_aggregates as (
+  select
+  program_name,
+  'pre_period' as period_type,
+  period_sub_type,
+  material_group_name,
+  category_name,
+  region_name,
+  store_id,
+  material_id,
+  ean,
+  business_day,
+  case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as day_type,
+  week_number,
+  count(distinct transaction_id) as num_txn,
+  sum(quantity) as total_qty,
+  sum(amount) as total_sales,
+  avg(unit_price) as avg_unit_price,
+  avg(regular_unit_price) as avg_regular_unit_price
+  from pre_txn_info_view
+  group by period_sub_type, material_group_name, region_name, store_id, material_id,ean, business_day, week_number,program_name,category_name
+)
+
+
+-- merge both data sources
+select * from test_period_daily_aggregates
+union
+select * from pre_period_daily_aggregates
+
+)
+%sql
+select program_name,count(*)
+from daily_agg_txn_info_merged_view
+group by all
+%sql
+select distinct program_name,count(*) 
+from dev.sandbox.pricing_measurement_raw_txn_data
+group by all
+df_daily_txn_merged_raw = spark.sql(f"""select * from daily_agg_txn_info_merged_view""")
+df_daily_txn_merged_raw.write.mode("overwrite").option("mergeSchema", "true").saveAsTable("dev.sandbox.pricing_measurement_raw_txn_data")
+%sql
+select material_id,store_id,business_day,ean,count(*) 
+from dev.sandbox.pricing_measurement_raw_txn_data
+group by all
+-- having count(*)>1
+order by 5 desc
+limit 10
+import pandas as pd
+
+# Read Excel
+promo_identified = (
+    pd.read_excel('/Workspace/Users/811775@lulumea.com/Adhocs/Promotions SETA.xlsx')
+    .drop(columns=['Start_date', 'End_date']) 
+    .drop_duplicates()                        
+)
+
+
+# Convert to Spark DataFrame and save
+spark.createDataFrame(promo_identified) \
+    .write.mode('overwrite') \
+    .saveAsTable('dev.sandbox.av_promo_identified')
+%sql
+select * 
+from dev.sandbox.av_promo_identified
+%sql
+-- Replace the holiday_list table with the latest table
+create or replace table dev.sandbox.av_promo_tag as 
+with region_wise as
+(
+select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+from dev.sandbox.pricing_measurement_raw_txn_data rd
+left join dev.sandbox.pg_uae_holiday_list hl
+on rd.business_day = hl.holiday_date
+
+
+group by all
+)
+,base AS (
+SELECT
+*,
+case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) AS past_price,
+(ROUND(total_sales / NULLIF(total_qty,0), 2) /
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) - 1) AS change_percentage
+FROM region_wise
+-- WHERE material_id = 1815319
+-- AND region_name = 'DUBAI'
+),
+direction_flag AS (
+SELECT *,
+CASE
+WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+END AS price_direction
+FROM base
+),
+
+events AS (
+SELECT
+region_name, material_id, business_day, price_direction,period_type,
+ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+FROM direction_flag
+WHERE price_direction IS NOT NULL
+),
+
+
+max_inc_day AS (
+
+  select 
+    *,
+    case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+  from events
+),
+
+valid_pairs AS (
+SELECT *,
+DATEDIFF(max_inc_day_new, business_day) AS gap
+FROM max_inc_day
+WHERE DATEDIFF(max_inc_day_new, business_day) <= 21
+AND price_direction = 'Decrease'
+)
+
+,final as
+(
+SELECT
+b.*,
+CASE
+WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+ON b.region_name = vp.region_name
+AND b.material_id = vp.material_id
+-- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+AND b.business_day >= vp.business_day 
+AND b.business_day <= vp.max_inc_day_new
+left join dev.sandbox.av_promo_identified pi
+on pi.material_id = b.material_id
+and pi.region_name = b.region_name
+and b.business_day between pi.actual_start_date and pi.actual_end_date
+)
+
+select 
+distinct * 
+from final
+-- where material_id = 1685342 AND region_name = 'DUBAI'
+-- where promo_flag = 0
+-- and holiday = 0
+where promo_flag = 0
+and holiday = 0
+# %sql
+# with region_wise as
+# (
+# select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+# from dev.sandbox.pricing_measurement_raw_txn_data rd
+# left join dev.sandbox.pg_uae_holiday_list hl
+# on rd.business_day = hl.holiday_date
+
+
+# group by all
+# )
+# ,base AS (
+# SELECT
+# *,
+# case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+# ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+# LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+# PARTITION BY region_name, material_id
+# ORDER BY business_day
+# ) AS past_price,
+# (ROUND(total_sales / NULLIF(total_qty,0), 2) /
+# LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+# PARTITION BY region_name, material_id
+# ORDER BY business_day
+# ) - 1) AS change_percentage
+# FROM region_wise
+# -- WHERE material_id = 1815319
+# -- AND region_name = 'DUBAI'
+# ),
+# direction_flag AS (
+# SELECT *,
+# CASE
+# WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+# WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+# END AS price_direction
+# FROM base
+# ),
+
+# events AS (
+# SELECT
+# region_name, material_id, business_day, price_direction,period_type,
+# ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+# MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+# FROM direction_flag
+# WHERE price_direction IS NOT NULL
+# ),
+
+
+# max_inc_day AS (
+
+#   select 
+#     *,
+#     case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+#   from events
+# ),
+
+# valid_pairs AS (
+# SELECT *,
+# DATEDIFF(max_inc_day_new, business_day) AS gap
+# FROM max_inc_day
+# WHERE DATEDIFF(max_inc_day_new, business_day) < 20
+# AND price_direction = 'Decrease'
+# )
+
+# ,final as
+# (
+# SELECT
+# b.*,
+# CASE
+# WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+# END AS promo_flag
+# FROM base b
+# LEFT JOIN valid_pairs vp
+# ON b.region_name = vp.region_name
+# AND b.material_id = vp.material_id
+# -- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+# AND b.business_day >= vp.business_day 
+# AND b.business_day < vp.max_inc_day_new
+# left join dev.sandbox.av_promo_identified pi
+# on pi.material_id = b.material_id
+# and pi.region_name = b.region_name
+# and b.business_day between pi.actual_start_date and pi.actual_end_date
+# )
+
+# select 
+# distinct * 
+# from final
+# -- where material_id = 1685342 AND region_name = 'DUBAI'
+# -- where promo_flag = 0
+# -- and holiday = 0
+%sql
+select material_id,region_name,business_day,count(*)
+from dev.sandbox.av_promo_tag
+group by all
+order by 4 desc
+limit 10
+%sql
+with region_wise as
+(
+select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+from dev.sandbox.pricing_measurement_raw_txn_data rd
+left join dev.sandbox.pg_uae_holiday_list hl
+on rd.business_day = hl.holiday_date
+
+
+group by all
+)
+,base AS (
+SELECT
+*,
+case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) AS past_price,
+(ROUND(total_sales / NULLIF(total_qty,0), 2) /
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) - 1) AS change_percentage
+FROM region_wise
+-- WHERE material_id = 1815319
+-- AND region_name = 'DUBAI'
+),
+direction_flag AS (
+SELECT *,
+CASE
+WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+END AS price_direction
+FROM base
+),
+
+events AS (
+SELECT
+region_name, material_id, business_day, price_direction,period_type,
+ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+FROM direction_flag
+WHERE price_direction IS NOT NULL
+),
+
+
+max_inc_day AS (
+
+  select 
+    *,
+    case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+  from events
+),
+
+valid_pairs AS (
+SELECT *,
+DATEDIFF(max_inc_day_new, business_day) AS gap
+FROM max_inc_day
+WHERE DATEDIFF(max_inc_day_new, business_day) <= 21
+AND price_direction = 'Decrease'
+)
+
+,final as
+(
+SELECT
+b.*,
+CASE
+WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+ON b.region_name = vp.region_name
+AND b.material_id = vp.material_id
+-- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+AND b.business_day >= vp.business_day 
+AND b.business_day <= vp.max_inc_day_new
+left join dev.sandbox.av_promo_identified pi
+on pi.material_id = b.material_id
+and pi.region_name = b.region_name
+and b.business_day between pi.actual_start_date and pi.actual_end_date
+)
+
+select 
+distinct * 
+from final
+where (promo_flag = 1
+or holiday = 1)
+and material_id = 1815319 and region_name = 'SHARJAH'
+%sql
+select * from dev.sandbox.av_promo_tag_days where material_id = 1815319 and region_name = 'SHARJAH'
+# %sql
+# create or replace table dev.sandbox.av_promo_tag_days as 
+# with region_wise as 
+# (
+#     select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+#     from dev.sandbox.pricing_measurement_raw_txn_data rd
+#     left join dev.sandbox.pg_uae_holiday_list hl 
+#     on rd.business_day = hl.holiday_date
+#     group by all
+# )
+# ,validity as 
+# (
+#   select period_type,
+#     count(distinct case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then business_day end) as pay_days,
+#     count(distinct case when day(business_day) not in (27,28,29,30,31,1,2,3,4,5) then business_day end) as non_pay_days
+#   from region_wise 
+#   group by all
+# )
+# ,window_calc as (
+#     SELECT
+#         *,
+#         case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+#         ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+#         LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+#             PARTITION BY region_name, material_id
+#             ORDER BY business_day
+#         ) AS past_price
+#     FROM region_wise
+# )
+# ,base AS (
+#     SELECT
+#         *,
+#         (unit_price_derived / NULLIF(past_price, 0) - 1) AS change_percentage
+#     FROM window_calc
+# ),
+# direction_flag AS (
+#     SELECT *,
+#         CASE 
+#             WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+#             WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+#         END AS price_direction
+#     FROM base
+# ),
+# events AS (
+#     SELECT 
+#         region_name, material_id, business_day, price_direction,period_type
+#     FROM direction_flag
+#     WHERE price_direction IS NOT NULL
+# ),
+# pairs AS (
+#     SELECT 
+#         e1.region_name, e1.material_id, e1.period_type,
+#         e1.business_day AS dec_day,
+#         MIN(e2.business_day) AS inc_day
+#     FROM events e1
+#     JOIN events e2
+#       ON e1.region_name = e2.region_name
+#      AND e1.material_id = e2.material_id
+#      AND e1.price_direction = 'Decrease'
+#      AND e2.price_direction = 'Increase'
+#      AND e2.business_day > e1.business_day
+#     GROUP BY e1.region_name, e1.material_id, e1.business_day,e1.period_type
+# ),
+# valid_pairs AS (
+#     SELECT *,
+#         DATEDIFF(inc_day, dec_day) AS gap
+#     FROM pairs
+#     WHERE DATEDIFF(inc_day, dec_day) < 20
+# )
+
+# ,final as
+# (
+# SELECT 
+#     b.*,
+#      CASE 
+#         WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0 
+#     END AS promo_flag
+# FROM base b
+# LEFT JOIN valid_pairs vp
+#     ON b.region_name = vp.region_name
+#     AND b.material_id = vp.material_id
+#     AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+# left join dev.sandbox.av_promo_identified pi 
+# on pi.material_id = b.material_id 
+# and pi.region_name = b.region_name
+# and b.business_day between pi.actual_start_date and pi.actual_end_date
+# )
+
+# select f.material_id,f.region_name,f.period_type,
+#     max(v.pay_days) as total_pay_days,
+#     max(v.non_pay_days) as total_non_pay_days,
+#     count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'PAY DAY' then business_day end) as invalid_pay_week_days,
+#     count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'NON PAY DAY' then business_day end) as invalid_non_pay_week_days,
+#     max(v.pay_days) - count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'PAY DAY' then business_day end) as valid_pay_days ,
+#     max(v.non_pay_days) -count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'NON PAY DAY' then business_day end) as valid_non_pay_days
+# from final f
+# join validity v on f.period_type = v.period_type
+# group by all
+%sql
+create or replace table dev.sandbox.av_promo_tag_days as 
+with region_wise as 
+(
+    select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+    from dev.sandbox.pricing_measurement_raw_txn_data rd
+    left join dev.sandbox.pg_uae_holiday_list hl 
+    on rd.business_day = hl.holiday_date
+    
+    group by all
+)
+ ,validity as 
+(
+  select period_type,
+    count(distinct case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then business_day end) as pay_days,
+    count(distinct case when day(business_day) not in (27,28,29,30,31,1,2,3,4,5) then business_day end) as non_pay_days
+  from region_wise 
+  group by all
+)
+,base AS (
+SELECT
+*,
+case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) AS past_price,
+(ROUND(total_sales / NULLIF(total_qty,0), 2) /
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) - 1) AS change_percentage
+FROM region_wise
+-- WHERE material_id = 1815319
+-- AND region_name = 'DUBAI'
+),
+direction_flag AS (
+SELECT *,
+CASE
+WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+END AS price_direction
+FROM base
+),
+
+events AS (
+SELECT
+region_name, material_id, business_day, price_direction,period_type,
+ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+FROM direction_flag
+WHERE price_direction IS NOT NULL
+),
+
+
+max_inc_day AS (
+
+  select 
+    *,
+    case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+  from events
+),
+
+valid_pairs AS (
+SELECT *,
+DATEDIFF(max_inc_day_new, business_day) AS gap
+FROM max_inc_day
+WHERE DATEDIFF(max_inc_day_new, business_day) <= 21
+AND price_direction = 'Decrease'
+)
+
+,final as
+(
+SELECT
+b.*,
+CASE
+WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+ON b.region_name = vp.region_name
+AND b.material_id = vp.material_id
+-- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+AND b.business_day >= vp.business_day 
+AND b.business_day <= vp.max_inc_day_new
+left join dev.sandbox.av_promo_identified pi
+on pi.material_id = b.material_id
+and pi.region_name = b.region_name
+and b.business_day between pi.actual_start_date and pi.actual_end_date
+)
+
+
+select f.material_id,f.region_name,f.period_type,
+    max(v.pay_days) as total_pay_days,
+    max(v.non_pay_days) as total_non_pay_days,
+    count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'PAY DAY' then business_day end) as invalid_pay_week_days,
+    count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'NON PAY DAY' then business_day end) as invalid_non_pay_week_days,
+    max(v.pay_days) - count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'PAY DAY' then business_day end) as valid_pay_days ,
+    max(v.non_pay_days) -count(distinct case when (promo_flag = 1 or holiday = 1) and week_type = 'NON PAY DAY' then business_day end) as valid_non_pay_days
+from final f
+join validity v on f.period_type = v.period_type
+group by all
+%sql
+select material_id,region_name,period_type,count(*) 
+from dev.sandbox.av_promo_tag_days 
+group by all order by 4 desc
+limit 10
+%sql
+select distinct category_name
+from dev.sandbox.pricing_measurement_raw_txn_data
+%sql
+create or replace table dev.sandbox.pricing_measurement_raw_txn_data1
+with cte as 
+(
+    select * 
+    from dev.sandbox.pricing_measurement_raw_txn_data pm
+)
+,raw_data as 
+(
+  select distinct cte.*
+  from cte 
+  join dev.sandbox.av_promo_tag pt 
+  on cte.material_id = pt.material_id 
+  and pt.region_name = cte.region_name 
+  and pt.business_day = cte.business_day
+)
+
+select *
+from raw_data
+-- where program_name = 'SETB Pricing October 2025'
+%sql
+select * 
+from dev.sandbox.av_promo_tag_days
+where material_id = 1815319
+and region_name = 'SHARJAH'
+spark.sql(f"""
+CREATE OR REPLACE TABLE dev.sandbox.av_pre_txn_info AS 
+WITH mg_seasonality AS (
+    SELECT DISTINCT 
+        region_name,
+        material_group_name,
+        month,
+        material_group_seasonality
+    FROM dev.sandbox.av_mg_cat_seasonality1
+),
+raw_data_with_seasonality AS (
+    SELECT 
+        rt.program_name,
+        rt.period_type,
+        rt.material_group_name,
+        rt.category_name,
+        rt.region_name,
+        rt.store_id,
+        rt.material_id,
+        rt.business_day,
+        day_type,
+        rt.ean,
+        rt.num_txn,
+        rt.total_qty,
+        rt.total_qty / NULLIF(ms.material_group_seasonality,0) AS deseason_qty,
+        rt.total_sales,
+        af.valid_non_pay_days,
+        af.valid_pay_days,
+        rt.avg_regular_unit_price,
+        ms.material_group_seasonality
+    FROM dev.sandbox.pricing_measurement_raw_txn_data1 rt
+    JOIN mg_seasonality ms 
+      ON ms.material_group_name = rt.material_group_name
+     AND ms.region_name = rt.region_name
+     AND ms.month = MONTH(rt.business_day)
+    join  dev.sandbox.av_promo_tag_days af
+    on af.material_id = rt.material_id
+    and af.Region_name = rt.region_name
+    and af.period_type = rt.period_type
+    WHERE rt.period_type = 'pre_period'
+),
+aggregated_data AS (
+    SELECT 
+        program_name,
+        period_type,
+        material_group_name,
+        category_name,
+        region_name,
+        store_id,
+        material_id,
+        day_type,
+        SUM(num_txn) AS num_txn_pre,
+        COUNT(DISTINCT business_day) AS num_days_pre,
+        MAX(material_group_seasonality) AS material_group_seasonality,
+        sum(total_qty) as total_qty_raw,
+        percentile_approx(deseason_qty, 0.2) AS p20_qty,   
+        percentile_approx(deseason_qty, 0.5) AS median_qty,
+        percentile_approx(deseason_qty, 0.9) AS p90_qty,
+        AVG(deseason_qty) AS avg_qty,
+        SUM(deseason_qty) AS total_qty_pre,    
+        max(case when day_type = 'PAY DAY' then valid_pay_days else valid_non_pay_days end) as days_preperiod,    
+        SUM(total_qty) / max(case when day_type = 'PAY DAY' then valid_pay_days else valid_non_pay_days end) AS daily_qty_raw,
+        SUM(deseason_qty) / max(case when day_type = 'PAY DAY' then valid_pay_days else valid_non_pay_days end) AS daily_qty,
+        SUM(total_sales) AS total_sales_pre,
+        AVG(avg_regular_unit_price) AS avg_regular_unit_price,
+        ROUND(SUM(total_sales) / NULLIF( sum(total_qty), 0), 2) AS unit_price_derived_pre
+    FROM raw_data_with_seasonality
+    GROUP BY all
+    -- program_name, period_type, material_group_name, region_name, store_id, material_id, day_type,
+    --     program_name,
+    --     period_type,
+    --     material_group_name,
+    --     region_name,
+    --     store_id,
+    --     material_id,
+    --     total_pay_days,
+    --     valid_non_pay_days
+        -- valid_pre_period
+        -- start_date_pre,
+        -- end_date_pre_overall
+),
+final AS (
+    SELECT 
+        program_name,
+        period_type,
+        material_group_name,
+        category_name,
+        region_name,
+        store_id,
+        material_id,
+        day_type,
+        days_preperiod,
+        total_qty_raw total_qty_raw_pre,
+        num_txn_pre,
+        num_days_pre,
+        total_qty_pre,
+        total_sales_pre,
+        ROUND(avg_regular_unit_price, 2) AS avg_regular_unit_price_pre,
+        ROUND(avg(unit_price_derived_pre),2) AS avg_unit_price_derived_pre,
+        round(daily_qty_raw,2) as daily_qty_raw,
+        ROUND(p20_qty, 2) AS p20_qty,
+        ROUND(median_qty, 2) AS median_qty,
+        ROUND(p90_qty, 2) AS p90_qty,
+        ROUND(avg_qty, 2) AS avg_qty,
+        ROUND(daily_qty, 2) AS daily_qty
+    FROM aggregated_data
+    group by all
+)
+
+SELECT * 
+FROM final
+order by material_id,store_id
+""")
+%sql
+select * 
+from dev.sandbox.av_pre_txn_info
+-- where program_name = 'SETB Pricing October 2025'
+%sql
+select pt.week_type,sum(quantity)
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+join dev.sandbox.av_promo_tag pt 
+on pt.material_id = pos.product_id   
+and pt.region_name = sm.region_name
+and pt.business_day = pos.business_day 
+where pos.store_id = 2065
+and material_id = 1009484
+and amount >0
+and bulk_sale_flag is null 
+and pt.period_type = 'pre_period'
+group by all
+%sql
+create or replace table analytics.pricing.accepted_recommendation_info_new
+WITH exploded_dates AS (
+    SELECT 
+        ar.region_name,
+        ar.material_id,
+        ean_final,
+        sequence(CAST(implementation_date AS DATE), CAST(final_end_date AS DATE)) AS date_range
+    FROM analytics.pricing.accepted_recommendation_info_new ar
+    JOIN dev.sandbox.av_promo_tag_days pt 
+        ON pt.material_id = ar.material_id 
+       AND pt.region_name = ar.region_name 
+    WHERE pt.period_type = 'test_period'
+),
+
+flattened_dates AS (
+    SELECT 
+        region_name,
+        material_id,
+        ean_final,
+        explode(date_range) AS business_day
+    FROM exploded_dates
+),
+
+labeled_days AS (
+    SELECT 
+        region_name,
+        material_id,
+        ean_final,
+        business_day,
+        CASE 
+            WHEN day(business_day) IN (27,28,29,30,31,1,2,3,4,5) THEN 'PAY DAY'
+            ELSE 'NON PAY DAY'
+        END AS day_type
+    FROM flattened_dates
+)
+,period_days as 
+(
+SELECT 
+    material_id,
+    region_name,
+    ean_final,
+    COUNT(DISTINCT business_day) FILTER (WHERE day_type = 'PAY DAY') AS pay_days,
+    COUNT(DISTINCT business_day) FILTER (WHERE day_type = 'NON PAY DAY') AS np_days
+FROM labeled_days
+GROUP BY material_id, region_name, ean_final
+)
+
+
+select ar.*,pay_days,np_days
+from analytics.pricing.accepted_recommendation_info_new ar 
+left join period_days pd 
+on pd.material_id = ar.material_id 
+and pd.region_name = ar.region_name 
+and pd.ean_final = ar.ean_final
+
+spark.sql(f"""
+create or replace table dev.sandbox.av_test_period as 
+WITH mg_seasonality AS (
+    SELECT DISTINCT 
+        region_name,
+        material_group_name,
+        month,
+        material_group_seasonality
+    FROM dev.sandbox.av_mg_cat_seasonality1
+),raw_data_with_seasonality AS (
+    SELECT 
+        rt.program_name,
+        rt.period_type,
+        rt.material_group_name,
+        rt.category_name,
+        rt.region_name,
+        rt.store_id,
+        rt.material_id,
+        rt.day_type,
+        rt.business_day,
+        rt.ean,
+        rt.num_txn,
+        rt.total_qty,
+        rt.total_qty / NULLIF(ms.material_group_seasonality,0) AS deseason_qty,
+        rt.total_sales,
+        rt.avg_regular_unit_price,
+        round(total_sales/total_qty, 2) as unit_price_derived,
+        max(ft.pay_days) as pay_days,
+        max(ft.np_days) as non_pay_days
+    FROM dev.sandbox.pricing_measurement_raw_txn_data1 rt
+    JOIN mg_seasonality ms 
+      ON ms.material_group_name = rt.material_group_name
+     AND ms.region_name = rt.region_name
+     AND ms.month = MONTH(rt.business_day)
+     join analytics.pricing.accepted_recommendation_info_new ft 
+     on ft.material_id = rt.material_id 
+     and ft.ean_final = rt.ean 
+     and ft.region_name = rt.region_name
+    WHERE rt.period_type = 'test_period'
+    group by all
+),aggregated_data AS (
+    SELECT 
+        program_name,
+        period_type,
+        material_group_name,
+        category_name,
+        region_name,
+        store_id,
+        material_id,
+        day_type,
+        --implementation_date,
+        max(case when day_type = 'PAY DAY' then pay_days else non_pay_days end ) as implementation_days,
+        SUM(num_txn) AS num_txn,
+        COUNT(DISTINCT business_day) AS num_days,
+        sum(total_qty) as total_qty_raw,
+        round(AVG(deseason_qty),2) AS avg_qty,
+        round(SUM(deseason_qty),2) AS total_qty,        
+        round(SUM(total_sales),2) AS total_sales,
+        round(AVG(avg_regular_unit_price),2) AS avg_regular_unit_price,
+        avg(unit_price_derived) as avg_unit_price_derived
+        
+    FROM raw_data_with_seasonality
+    GROUP BY 
+        program_name,
+        period_type,
+        material_group_name,
+        category_name,
+        region_name,
+        --implementation_date,
+        store_id,
+        material_id,
+        day_type
+)
+
+
+select * from aggregated_data
+""")
+%sql
+select distinct program_name
+from dev.sandbox.av_test_period
+-- and store_id = 2300
+-- and material_id = 1815319
+%sql
+select sum(quantity)
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+-- join dev.sandbox.av_promo_tag pt 
+-- on pt.material_id = pos.product_id   
+-- and pt.region_name = sm.region_name
+-- and pt.business_day = pos.business_day 
+where business_day between '2025-08-14' and current_date
+and business_day != '2025-09-04'
+and pos.store_id = 2300
+and product_id = 1815319
+and amount >0
+and bulk_sale_flag is null 
+-- and pt.period_type = 'test_period'
+group by all
+%sql
+select * from dev.sandbox.av_pre_txn_info limit 5
+# %sql
+# CREATE OR REPLACE TEMP VIEW test_skus_comparative_view as 
+# (
+#   select 
+  
+#   distinct
+#    pt.program_name,
+#   pt.material_group_name,
+#   pt.category_name,
+#   pt.region_name,
+#   pt.store_id,
+#   pt.material_id,
+#   -- pt.ean,
+#   pt.total_qty_raw_pre,
+#   pt.num_txn_pre,
+#   pt.num_days_pre,
+#   pt.total_qty_pre,
+#   days_preperiod,
+#   pt.total_sales_pre as total_sales_pre,
+#   pt.avg_regular_unit_price_pre,
+#   pt.avg_unit_price_derived_pre,
+#   pt.p20_qty,
+#   pt.median_qty,
+#   pt.p90_qty,
+#   pt.daily_qty_raw,
+#   pt.avg_qty as avg_qty_pre,
+#   pt.daily_qty as pre_deseasonalized_qty,
+#   COALESCE(tp.num_txn, 0) AS num_txn,
+#   COALESCE(tp.num_days, 0) AS num_days,
+#   COALESCE(tp.total_qty_raw, 0) AS test_raw_qty,
+#   COALESCE(tp.avg_qty, 0) AS avg_qty,
+#   COALESCE(tp.total_qty, 0) AS test_deseasonalized_qty,
+#   COALESCE(tp.total_sales, 0) AS total_sales_test_raw,
+#   COALESCE(tp.avg_regular_unit_price, 0) AS avg_regular_unit_price,
+#   COALESCE(tp.avg_unit_price_derived, 0) AS avg_test_unit_price_derived,
+#   t3.price_change_direction as price_change_direction,
+#   pt.day_type,
+#   coalesce(case when pt.day_type = 'PAY DAY' then pay_days else np_days end,implementation_days) as implementation_days,
+#   ss.valid_counts,
+#   ss.valid_price_perc
+#   from dev.sandbox.av_pre_txn_info pt
+#   left join dev.sandbox.av_test_period tp
+#   on pt.material_id = tp.material_id 
+#   and pt.store_id = tp.store_id 
+#   and pt.day_type = tp.day_type
+#   -- and pt.ean = tp.ean 
+#   and pt.region_name = tp.region_name
+#   left join (select distinct material_id,region_name,min(pay_days) as pay_days,min(np_days) as np_days 
+#   from  analytics.pricing.seta_accepted_recommendation_info_new 
+#   group by all 
+#   ) ri
+#   on ri.material_id = pt.material_id 
+#   -- and ri.ean_final = pt.ean 
+#   and ri.region_name= pt.region_name
+#   left join dev.sandbox.all_stores_view t3
+#   on pt.material_id = t3.material_id
+#    and pt.region_name = t3.region_name
+#    and pt.store_id = t3.store_id
+#   --  and pt.ean = t3.ean
+#   left join (select distinct material_id,store_id,avg(valid_counts) as valid_counts,avg(valid_price_perc)  as valid_price_perc
+#   from dev.sandbox.av_store_sku_violations 
+#   group by all) ss
+#   on ss.material_id = pt.material_id 
+#   and ss.store_id = pt.store_id 
+#   -- and ss.ean = pt.ean
+#   group by all
+# )
+%sql
+CREATE OR REPLACE TEMP VIEW test_skus_comparative_view AS 
+(
+  SELECT DISTINCT
+    COALESCE(pt.program_name, tp.program_name) AS program_name,
+    COALESCE(pt.material_group_name, tp.material_group_name) AS material_group_name,
+    COALESCE(pt.category_name, tp.category_name) AS category_name,
+    COALESCE(pt.region_name, tp.region_name) AS region_name,
+    COALESCE(pt.store_id, tp.store_id) AS store_id,
+    COALESCE(pt.material_id, tp.material_id) AS material_id,
+    COALESCE(pt.total_qty_raw_pre, 0) AS total_qty_raw_pre,
+    COALESCE(pt.num_txn_pre, 0) AS num_txn_pre,
+    COALESCE(pt.num_days_pre, 0) AS num_days_pre,
+    COALESCE(pt.total_qty_pre, 0) AS total_qty_pre,
+    COALESCE(pt.days_preperiod, 0) AS days_preperiod,
+    COALESCE(pt.total_sales_pre, 0) AS total_sales_pre,
+    COALESCE(pt.avg_regular_unit_price_pre, 0) AS avg_regular_unit_price_pre,
+    COALESCE(pt.avg_unit_price_derived_pre, 0) AS avg_unit_price_derived_pre,
+    COALESCE(pt.p20_qty, 0) AS p20_qty,
+    COALESCE(pt.median_qty, 0) AS median_qty,
+    COALESCE(pt.p90_qty, 0) AS p90_qty,
+    COALESCE(pt.daily_qty_raw, 0) AS daily_qty_raw,
+    COALESCE(pt.avg_qty, 0) AS avg_qty_pre,
+    COALESCE(pt.daily_qty, 0) AS pre_deseasonalized_qty,
+
+    COALESCE(tp.num_txn, 0) AS num_txn,
+    COALESCE(tp.num_days, 0) AS num_days,
+    COALESCE(tp.total_qty_raw, 0) AS test_raw_qty,
+    COALESCE(tp.avg_qty, 0) AS avg_qty,
+    COALESCE(tp.total_qty, 0) AS test_deseasonalized_qty,
+    COALESCE(tp.total_sales, 0) AS total_sales_test_raw,
+    COALESCE(tp.avg_regular_unit_price, 0) AS avg_regular_unit_price,
+    COALESCE(tp.avg_unit_price_derived, 0) AS avg_test_unit_price_derived,
+
+    t3.price_change_direction,
+    COALESCE(pt.day_type,tp.day_type) as day_type,
+    COALESCE(
+      CASE WHEN pt.day_type = 'PAY DAY' THEN ri.pay_days ELSE ri.np_days END,
+      implementation_days
+    ) AS implementation_days,
+    ss.valid_counts,
+    ss.valid_price_perc
+
+  FROM dev.sandbox.av_pre_txn_info pt
+
+  FULL OUTER JOIN dev.sandbox.av_test_period tp
+    ON pt.material_id = tp.material_id
+   AND pt.store_id = tp.store_id
+   AND pt.day_type = tp.day_type
+   AND pt.region_name = tp.region_name
+
+  FULL OUTER JOIN (
+    SELECT 
+      material_id,
+      region_name,
+      MIN(pay_days) AS pay_days,
+      MIN(np_days) AS np_days
+      --, MIN(implementation_days) AS implementation_days
+    FROM analytics.pricing.seta_accepted_recommendation_info_new 
+    GROUP BY material_id, region_name
+  ) ri
+    ON COALESCE(pt.material_id, tp.material_id) = ri.material_id
+   AND COALESCE(pt.region_name, tp.region_name) = ri.region_name
+
+   JOIN (select distinct material_id,region_name,store_id,price_change_direction from dev.sandbox.all_stores_view) t3
+    ON COALESCE(pt.material_id, tp.material_id) = t3.material_id
+   AND COALESCE(pt.region_name, tp.region_name) = t3.region_name
+   AND COALESCE(pt.store_id, tp.store_id) = t3.store_id
+
+  FULL OUTER JOIN (
+    SELECT 
+      material_id,
+      store_id,
+      AVG(valid_counts) AS valid_counts,
+      AVG(valid_price_perc) AS valid_price_perc
+    FROM dev.sandbox.av_store_sku_violations 
+    GROUP BY material_id, store_id
+  ) ss
+    ON COALESCE(pt.material_id, tp.material_id) = ss.material_id
+   AND COALESCE(pt.store_id, tp.store_id) = ss.store_id
+)
+
+%sql
+select * from dev.sandbox.all_stores_view
+%sql
+select tp.*
+from dev.sandbox.av_test_period as tp
+where store_id = 2560
+and material_id = 524424
+%sql
+select * 
+from dev.sandbox.av_pre_txn_info
+where store_id = 2560
+and material_id = 524424
+%sql
+select distinct * 
+from test_skus_comparative_view
+where store_id = 2560
+and material_id = 524424
+%sql
+select sum(amount)
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+-- join dev.sandbox.av_promo_tag pt 
+-- on pt.material_id = pos.product_id   
+-- and pt.region_name = sm.region_name
+-- and pt.business_day = pos.business_day 
+where business_day between '2025-08-14' and current_date
+and business_day != '2025-09-04'
+and pos.store_id = 2560
+and product_id = 524424
+and amount >0
+and bulk_sale_flag is null 
+-- and pt.period_type = 'test_period'
+group by all
+%sql
+select store_id,material_id,day_type,count(*)
+from test_skus_comparative_view
+group by all
+order by 4 desc
+limit 5
+# convert the store-material overall master comparative view to a pandas df
+df_test_skus_comparative_view = spark.sql("select ts.*,material_name from test_skus_comparative_view ts join gold.material.material_master mm on mm.material_id = ts.material_id").toPandas()
+df_test_skus_comparative_view.shape
+%md
+## Measurement
+import pandas as pd
+
+# === Base Store-SKU Data Preparation ===
+df = df_test_skus_comparative_view.copy()
+df_test_skus_comparative_view[df_test_skus_comparative_view['material_id']=='1891606']
+df_test_skus_comparative_view.columns
+df['total_qty_pre_norm'] = df['implementation_days'] * (df['pre_deseasonalized_qty'])
+
+df['total_qty_pre_norm_raw'] = df['implementation_days'] * (df['daily_qty_raw'])
+
+# Filter for valid mapping_id (equal test/control stores)
+df_filtered = df.copy()
+df_filtered[df_filtered['material_id']=='1815319'].sort_values(['material_id','store_id']).display(truncate = False)
+%sql
+create or replace table dev.sandbox.av_material_cost as
+with cte as 
+(
+    select distinct sd.material_id,material_name,left(business_date,6) as month,sm.region_name,ean.ean_final,round(avg(sd.moving_avg_price),2) as cost_per_unit,numerator,denominator, round(avg(sd.moving_avg_price)*(numerator/denominator),2) as cogs 
+    from gold.store.stock_details sd 
+    left join gold.store.store_master sm 
+    on sm.store_id = sd.store_id
+    join dev.sandbox.av_all_ean ean
+    on sd.material_id = ean.material_id 
+    and ean.region_name = sm.region_name
+    group by all
+)
+
+select * 
+from cte
+qualify row_number() over (partition by material_id,region_name,ean_final order by month desc) = 1
+# read the sandbox table prepared earlier
+df_gp_info = spark.sql('select material_id,region_name,avg(cogs) as cogs from dev.sandbox.av_material_cost group by all').toPandas()
+
+# select key columns
+COLS = ['region_name',  'material_id','cogs']
+df_gp_info = df_gp_info[COLS]
+
+# filter for current region set
+# df_gp_info = df_gp_info[df_gp_info['region_name'].isin(list(region_list))]
+
+# check if all materials and all required regions are present and raise assertion error accordingly
+# skus_presence_flag = set(df_gp_info.material_id.unique()) == set(all_stores_df.material_id.unique())
+# missing_regions = set(all_stores_df.region_name.unique()) - set(df_gp_info.region_name.unique())
+# if missing_regions:
+#     raise AssertionError(f"Missing regions: {sorted(missing_regions)}")
+# region_presence_flag = set(df_gp_info.region_name.unique()) == set(all_stores_df.region_name.unique())
+# assert skus_presence_flag, "Not all SKUs are present in the data"
+# assert region_presence_flag, "Not all regions are present in the data"
+df_gp_info.head(5)
+df_filtered.columns
+agg_final = df_filtered.groupby(
+    ["material_id","material_name","region_name",'program_name','material_group_name','category_name','price_change_direction','store_id','days_preperiod','day_type','implementation_days'],  # adjust columns as per your need ,'days_preperiod','day_type','implementation_days'
+    as_index=False
+).agg({
+    "test_deseasonalized_qty": "sum",
+    "total_qty_pre_norm_raw":"sum",
+    "pre_deseasonalized_qty":"sum",
+    "total_qty_pre_norm": "sum",
+    "total_qty_pre":"sum",
+    "total_qty_raw_pre":"sum",
+    "total_sales_pre":"sum",
+    "total_sales_test_raw":"sum",
+    "test_raw_qty":"sum",
+    "valid_price_perc":"mean",
+
+}).reset_index(drop=True)
+agg_final = agg_final.groupby(["store_id", "material_id"]).filter(
+    lambda x: x["test_deseasonalized_qty"].sum() != 0
+)
+%sql
+select * from dev.sandbox.all_violation_df
+agg_final = agg_final.groupby(["store_id", "material_id"]).filter(
+    lambda x: x["total_qty_pre"].sum() != 0
+)
+agg_final.loc[
+    (agg_final['material_id'] == '1815319') &
+    (agg_final['region_name'] == 'DUBAI'),
+    'total_qty_pre_norm'
+].sum()
+agg_final.columns
+
+agg_final.loc[
+    (agg_final['material_id'] == '1891606') &
+    (agg_final['region_name'] == 'ABU DHABI'),
+    'total_qty_pre_norm'
+].sum()
+spark.createDataFrame(agg_final).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev.sandbox.store_level")
+agg_final = agg_final.groupby(
+    ["material_id","material_name","region_name",'program_name','material_group_name',"category_name",'price_change_direction','day_type','implementation_days'],  # adjust columns as per your need ,'day_type','days_preperiod','implementation_days'
+    as_index=False
+).agg({
+    "days_preperiod":"max",
+    "test_deseasonalized_qty": "sum",
+    "pre_deseasonalized_qty":"sum",
+    "total_qty_pre_norm_raw":"sum",
+    "total_qty_pre_norm": "sum",
+    "total_qty_pre":"sum",
+    "total_qty_raw_pre":"sum",
+    "total_sales_pre":"sum",
+    "total_sales_test_raw":"sum",
+    "test_raw_qty":"sum",
+    "valid_price_perc":"mean",
+
+}).reset_index(drop=True)
+spark.createDataFrame(agg_final).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev.sandbox.region_level")
+agg_final['material_id'] = agg_final['material_id'].astype(str)
+df_gp_info['material_id'] = df_gp_info['material_id'].astype(str)
+
+agg_final['region_name'] = agg_final['region_name'].astype(str)
+df_gp_info['region_name'] = df_gp_info['region_name'].astype(str)
+
+agg_final = agg_final.merge(
+    df_gp_info, 
+    on=['material_id', 'region_name'],
+    how='inner'
+)
+agg_final.loc[
+    (agg_final['material_id'] == '1891606') &
+    (agg_final['region_name'] == 'ABU DHABI'),
+    'total_qty_pre_norm'
+].sum()
+# import numpy as np
+# agg_final = agg_final.groupby(
+#     ["material_id","region_name",'program_name','material_group_name','price_change_direction'],  # adjust columns as per your need
+#     as_index=False
+# ).agg({
+#     "test_deseasonalized_qty": "sum",
+#     "total_qty_pre_norm": "sum",
+#     "total_qty_raw_pre":"sum",
+#     "total_sales_pre":"sum",
+#     "total_sales_test_raw":"sum",
+#     "test_raw_qty":"sum",
+#     "valid_price_perc":"mean",
+#     "cogs":"mean"
+# }).reset_index(drop=True)
+# agg_final['avg_test_unit_price_derived'] = agg_final['total_sales_test_raw']/agg_final['test_raw_qty']
+# agg_final['avg_unit_price_derived_pre'] = agg_final['total_sales_pre']/agg_final['total_qty_raw_pre']
+
+# agg_final['test_deseasonalized_qty'].fillna(0,inplace = True)
+# agg_final['incremental_quantity'] = agg_final['test_deseasonalized_qty'] - agg_final['total_qty_pre_norm']
+# agg_final['incremental_quantity_adj'] = np.where(
+#     (agg_final['price_change_direction'] == "Increase") & (agg_final['incremental_quantity'] > 0),
+#     0,
+#     agg_final['incremental_quantity']
+# )
+# # Calculate expected adjusted quantity
+# agg_final['expected_qty_adj'] = agg_final['test_deseasonalized_qty'] - agg_final['incremental_quantity_adj']
+# agg_final['qty_delta'] = agg_final['test_deseasonalized_qty'] - agg_final['expected_qty_adj']
+# agg_final['total_sales_pre_norm'] = agg_final['expected_qty_adj'] * agg_final['avg_unit_price_derived_pre']
+# agg_final['total_sales_test'] = agg_final['test_deseasonalized_qty'] * agg_final['avg_test_unit_price_derived']
+# agg_final['sales_delta'] = agg_final['total_sales_test'] - agg_final['total_sales_pre_norm']
+# agg_final['expected_profit'] = agg_final['expected_qty_adj'] * (agg_final['avg_unit_price_derived_pre'] - agg_final['cogs'])
+# agg_final['observed_profit'] = agg_final['test_deseasonalized_qty'] * (agg_final['avg_test_unit_price_derived'] - agg_final['cogs'])
+
+# agg_final['incremental_profit'] = agg_final['observed_profit'] - agg_final['expected_profit']
+
+# # Profit percentage gain
+# agg_final['profit_perc_gain'] = (
+#     (agg_final['observed_profit'] - agg_final['expected_profit']) / agg_final['expected_profit']
+# )
+
+# # Profit uplift
+# agg_final['profit_uplift'] = agg_final['observed_profit'] / agg_final['expected_profit']
+# agg_final['observed_profit'].fillna(0,inplace = True)
+# import numpy as np
+
+# agg_final['test_violation_flag'] = np.where(
+#     (agg_final['valid_price_perc'].isna()) | 
+#     (agg_final['valid_price_perc'] > 0.85),
+#     0,
+#     1
+# )
+# agg_final['expected_profit'] = agg_final['expected_qty_adj'] * (agg_final['avg_unit_price_derived_pre'] - agg_final['cogs'])
+# agg_final['observed_profit'] = agg_final['test_deseasonalized_qty'] * (agg_final['avg_test_unit_price_derived'] - agg_final['cogs'])
+
+
+# agg_final
+
+# import numpy as np
+# agg_final1 = agg_final.groupby(
+#     ["material_id","region_name",'program_name','material_group_name','category_name','price_change_direction'],  # adjust columns as per your need
+#     as_index=False
+# ).agg({
+#     "test_deseasonalized_qty": "sum",
+#     "total_qty_pre_norm": "sum",
+#     "total_qty_pre_norm_raw":"sum",
+#     "total_qty_raw_pre":"sum",
+#     "total_sales_pre":"sum",
+#     "total_sales_test_raw":"sum",
+#     "test_raw_qty":"sum",
+#     "valid_price_perc":"mean",
+#     "cogs":"mean"
+# }).reset_index(drop=True)
+# agg_final1['avg_test_unit_price_derived'] = agg_final1['total_sales_test_raw']/agg_final1['test_raw_qty']
+# agg_final1['avg_unit_price_derived_pre'] = agg_final1['total_sales_pre']/agg_final1['total_qty_raw_pre']
+
+
+
+# agg_final1['acutal_qty'] = agg_final1['test_raw_qty'] * ((agg_final1['total_qty_pre_norm']/agg_final1['total_qty_pre_norm_raw'])/(agg_final1['test_raw_qty']/agg_final1['test_deseasonalized_qty']))
+# agg_final1['incremental_quantity'] = agg_final1['total_qty_pre_norm_raw'] - agg_final1['acutal_qty'] 
+# # Incremental quantity
+# # agg_final1['incremental_quantity'] = (
+# #     agg_final1['test_deseasonalized_qty'] - agg_final1['total_qty_pre_norm']
+# # )
+
+# # Adjust incremental quantity:
+# # - If price increased (post > pre) but incremental qty > 0 → set to 0
+# agg_final1['incremental_quantity_adj'] = np.where(
+#     (agg_final1['avg_test_unit_price_derived'] > agg_final1['avg_unit_price_derived_pre']) &
+#     (agg_final1['incremental_quantity'] > 0),
+#     0,
+#     agg_final1['incremental_quantity']
+# )
+
+# # Expected adjusted quantity
+# agg_final1['expected_qty_adj'] = (
+#     agg_final1['acutal_qty'] - agg_final1['incremental_quantity_adj']
+# )
+
+# # Quantity delta
+# agg_final1['qty_delta'] = (
+#     agg_final1['acutal_qty'] - agg_final1['expected_qty_adj']
+# )
+
+# # Sales calculations
+# agg_final1['total_sales_pre_norm'] = (
+#     agg_final1['expected_qty_adj'] * agg_final1['avg_unit_price_derived_pre']
+# )
+# agg_final1['total_sales_test'] = (
+#     agg_final1['acutal_qty'] * agg_final1['avg_test_unit_price_derived']
+# )
+# agg_final1['sales_delta'] = agg_final1['total_sales_test'] - agg_final1['total_sales_pre_norm']
+# agg_final1['old_margin'] = (agg_final1['avg_unit_price_derived_pre'] - agg_final1['cogs'])/agg_final1['avg_unit_price_derived_pre']
+# agg_final1['new_margin'] = (agg_final1['avg_test_unit_price_derived'] - agg_final1['cogs'])/agg_final1['avg_test_unit_price_derived']
+
+# # Profit calculations
+# agg_final1['expected_profit'] = (
+#     agg_final1['expected_qty_adj'] * (agg_final1['avg_unit_price_derived_pre'] - agg_final1['cogs'])
+# )
+# agg_final1['observed_profit'] = (
+#     agg_final1['acutal_qty'] * (agg_final1['avg_test_unit_price_derived'] - agg_final1['cogs'])
+# )
+# agg_final1['observed_profit'].fillna(0, inplace=True)
+
+# agg_final1['incremental_profit'] = agg_final1['observed_profit'] - agg_final1['expected_profit']
+
+# # Profit % gain and uplift
+# agg_final1['profit_perc_gain'] = np.where(
+#     agg_final1['expected_profit'] != 0,
+#     (agg_final1['observed_profit'] - agg_final1['expected_profit']) / agg_final1['expected_profit'],
+#     np.nan
+# )
+# agg_final1['profit_uplift'] = np.where(
+#     agg_final1['expected_profit'] != 0,
+#     agg_final1['observed_profit'] / agg_final1['expected_profit'],
+#     np.nan
+# )
+
+# # Test violation flag
+# agg_final1['test_violation_flag'] = np.where(
+#     (agg_final1['material_id'] == '1815319') |
+#     (agg_final1['valid_price_perc'].isna()) | 
+#     (agg_final1['valid_price_perc'] > 0.80),
+#     0,
+#     1
+# )
+
+
+# agg_final1
+import numpy as np
+agg_final = agg_final.groupby(
+    ["material_id","material_name","region_name",'program_name','material_group_name',"category_name",'price_change_direction'],  # adjust columns as per your need
+    as_index=False
+).agg({
+    "test_deseasonalized_qty": "sum",
+    'total_qty_pre_norm_raw':"sum",
+    "total_qty_pre_norm": "sum",
+    "total_qty_raw_pre":"sum",
+    "total_sales_pre":"sum",
+    "total_sales_test_raw":"sum",
+    "test_raw_qty":"sum",
+    "valid_price_perc":"mean",
+    "cogs":"mean"
+}).reset_index(drop=True)
+agg_final['avg_test_unit_price_derived'] = agg_final['total_sales_test_raw']/agg_final['test_raw_qty']
+agg_final['avg_unit_price_derived_pre'] = agg_final['total_sales_pre']/agg_final['total_qty_raw_pre']
+# Incremental quantity
+agg_final['incremental_quantity'] = (
+    agg_final['test_deseasonalized_qty'] - agg_final['total_qty_pre_norm']
+)
+
+agg_final['price_change_flag_dashboard'] = np.where(
+    agg_final['avg_test_unit_price_derived'] > agg_final['avg_unit_price_derived_pre'],
+    'Increase',
+    np.where(
+        agg_final['avg_test_unit_price_derived'] < agg_final['avg_unit_price_derived_pre'],
+        'Decrease',
+        'No Change'
+    )
+)
+
+
+# Adjust incremental quantity:
+# - If price increased (post > pre) but incremental qty > 0 → set to 0
+agg_final['incremental_quantity_adj'] = np.where(
+    (agg_final['avg_test_unit_price_derived'] > agg_final['avg_unit_price_derived_pre']) &
+    (agg_final['incremental_quantity'] > 0),
+    0,
+    agg_final['incremental_quantity']
+)
+
+# Expected adjusted quantity
+agg_final['expected_qty_adj'] = (
+    agg_final['test_deseasonalized_qty'] - agg_final['incremental_quantity_adj']
+)
+
+# Quantity delta
+agg_final['qty_delta'] = (
+    agg_final['test_deseasonalized_qty'] - agg_final['expected_qty_adj']
+)
+
+# Sales calculations
+agg_final['total_sales_pre_norm'] = (
+    agg_final['expected_qty_adj'] * agg_final['avg_unit_price_derived_pre']
+)
+agg_final['total_sales_test'] = (
+    agg_final['test_deseasonalized_qty'] * agg_final['avg_test_unit_price_derived']
+)
+agg_final['sales_delta'] = agg_final['total_sales_test'] - agg_final['total_sales_pre_norm']
+agg_final['old_margin'] = (agg_final['avg_unit_price_derived_pre'] - agg_final['cogs'])/agg_final['avg_unit_price_derived_pre']
+agg_final['new_margin'] = (agg_final['avg_test_unit_price_derived'] - agg_final['cogs'])/agg_final['avg_test_unit_price_derived']
+
+# Profit calculations
+agg_final['expected_profit'] = (
+    agg_final['expected_qty_adj'] * (agg_final['avg_unit_price_derived_pre'] - agg_final['cogs'])
+)
+agg_final['observed_profit'] = (
+    agg_final['test_deseasonalized_qty'] * (agg_final['avg_test_unit_price_derived'] - agg_final['cogs'])
+)
+agg_final['observed_profit'].fillna(0, inplace=True)
+
+agg_final['incremental_profit'] = agg_final['observed_profit'] - agg_final['expected_profit']
+
+# Profit % gain and uplift
+agg_final['profit_perc_gain'] = np.where(
+    agg_final['expected_profit'] != 0,
+    (agg_final['observed_profit'] - agg_final['expected_profit']) / agg_final['expected_profit'],
+    np.nan
+)
+agg_final['profit_uplift'] = np.where(
+    agg_final['expected_profit'] != 0,
+    agg_final['observed_profit'] / agg_final['expected_profit'],
+    np.nan
+)
+
+# Test violation flag
+agg_final['test_violation_flag'] = np.where(
+    (agg_final['material_id'] == '1815319') |
+    (agg_final['valid_price_perc'].isna()) | 
+    (agg_final['valid_price_perc'] > 0.9),
+    0,
+    1
+)
+
+
+agg_final
+agg_final[
+       (agg_final['test_violation_flag'] == 0) &
+        (agg_final['test_deseasonalized_qty'] != 0) &
+        ~(
+            ((agg_final['material_id'] == '1891606') 
+            #  | (agg_final['material_id'] == '1658780')
+             ) &
+            (agg_final['region_name'].isin(['ABU DHABI', 'SHARJAH']))
+        )
+    ].groupby(['program_name','price_change_flag_dashboard'])[['incremental_profit', 'sales_delta', 'incremental_quantity_adj']].sum().reset_index()
+agg_final[
+       (agg_final['test_violation_flag'] == 0) &
+        (agg_final['test_deseasonalized_qty'] != 0) &
+        ~(
+            ((agg_final['material_id'] == '1891606') 
+            #  | (agg_final['material_id'] == '1658780')
+             ) &
+            (agg_final['region_name'].isin(['ABU DHABI', 'SHARJAH']))
+        )
+    ].groupby(['program_name'])[['incremental_profit', 'sales_delta', 'incremental_quantity_adj']].sum().reset_index()
+agg_final[ (agg_final['test_violation_flag'] == 0) &
+        (agg_final['test_deseasonalized_qty'] != 0) &
+        ~(
+            ((agg_final['material_id'] == '1891606') | (agg_final['material_id'] == '1658780')) &
+            (agg_final['region_name'].isin(['ABU DHABI', 'SHARJAH']))
+        )].sort_values(['incremental_profit'],ascending = True).display(Truncate = False)
+agg_final['price_change_direction'] = agg_final['price_change_direction'].astype(str)
+agg_final.sort_values(['material_id', 'region_name'], ascending=True)
+display(agg_final)
+%sql
+select * from dev.sandbox.av_exploration_ex
+
+spark.createDataFrame(agg_final).write.option('overwriteSchema',True).mode('overwrite').saveAsTable('dev.sandbox.av_exploration_ex')
+%sql
+select material_id,region_name,count(*)
+from dev.sandbox.av_exploration_ex
+where total_sales_test != 0
+and test_violation_flag = 0
+group by all 
+order by 3 desc
+limit 10
+%sql
+select business_day,sum(amount)/sum(quantity) as price,sum(quantity) as total_qty
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-01-01' and current_date
+and product_id = 411985
+and region_name = 'ABU DHABI'
+group by all
+%sql
+select * 
+from dev.sandbox.av_promo_tag 
+where material_id = 1815316
+and region_name = 'DUBAI'
+%sql
+-- create or replace table dev.sandbox.av_promo_tag as 
+with region_wise as 
+(
+    select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+    from dev.sandbox.pricing_measurement_raw_txn_data rd
+    left join dev.sandbox.pg_uae_holiday_list hl 
+    on rd.business_day = hl.holiday_date
+    
+    group by all
+)
+,base AS (
+    SELECT
+        *,
+        case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+        ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+        LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+            PARTITION BY region_name, material_id
+            ORDER BY business_day
+        ) AS past_price,
+        (ROUND(total_sales / NULLIF(total_qty,0), 2) / 
+            LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+                PARTITION BY region_name, material_id 
+                ORDER BY business_day
+            ) - 1) AS change_percentage
+    FROM region_wise
+    -- WHERE material_id = 1815319
+    --   AND region_name = 'DUBAI'
+),
+direction_flag AS (
+    SELECT *,
+        CASE 
+            WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+            WHEN period_type = 'pre_period' and  change_percentage < -0.1 THEN 'Decrease'
+        END AS price_direction
+    FROM base
+),
+events AS (
+    SELECT 
+        region_name, material_id, business_day, price_direction,period_type,
+        ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn
+    FROM direction_flag
+    WHERE price_direction IS NOT NULL
+),
+pairs AS (
+    SELECT 
+        e1.region_name, e1.material_id, e1.period_type,
+        e1.business_day AS dec_day,
+        MIN(e2.business_day) AS inc_day
+    FROM events e1
+    JOIN events e2
+      ON e1.region_name = e2.region_name
+     AND e1.material_id = e2.material_id
+     AND e1.price_direction = 'Decrease'
+     AND e2.price_direction = 'Increase'
+     AND e2.business_day > e1.business_day
+    GROUP BY e1.region_name, e1.material_id, e1.business_day,e1.period_type
+),
+valid_pairs AS (
+    SELECT *,
+        DATEDIFF(inc_day, dec_day) AS gap
+    FROM pairs
+    WHERE DATEDIFF(inc_day, dec_day) < 20
+)
+,final as
+(
+SELECT 
+    b.*,
+    CASE 
+        WHEN vp.material_id IS NOT NULL THEN 1 ELSE 0 
+    END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+    ON b.region_name = vp.region_name
+    AND b.material_id = vp.material_id
+    AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+)
+
+
+
+
+
+select distinct * 
+from final
+where material_id = 701105
+and region_name = 'SHARJAH'
+#[agg_sku_exp_grp['price_change_direction'] != 'No Change'] 
+agg_sku_exp_grp_spark = spark.createDataFrame(agg_final[ (agg_final['test_violation_flag'] == 0) &
+        (agg_final['test_deseasonalized_qty'] != 0) &
+        ~(
+            ((agg_final['material_id'] == '1891606')) &
+            (agg_final['region_name'].isin(['ABU DHABI', 'SHARJAH']))
+        )])
+# agg_sku_exp_grp_spark = agg_sku_exp_grp_spark.dropDuplicates(["material_id"])
+agg_sku_exp_grp_spark.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev.sandbox.all_violation_df")
+%sql
+desc analytics.pricing.accepted_recommendation_info_new
+%sql
+create or replace table dev.sandbox.export
+select distinct vd.*,fr.previous_price as pre_price_observed, fr.accepted_price as recommended_price,avg_unit_price_derived_pre - pre_price_observed as diff,implementation_final as implemented_date
+from dev.sandbox.av_exploration_ex vd 
+join gold.material.material_master mm 
+on vd.material_id = mm.material_id
+join analytics.pricing.accepted_recommendation_info_new fr 
+on fr.material_id = vd.material_id 
+and fr.region_name = vd.region_name
+-- where test_violation_flag = 0
+%sql
+select * 
+from dev.sandbox.all_violation_df
+where test_violation_flag = 0
+order by incremental_profit asc 
+-- limit 5
+%sql
+select * from analytics.pricing.seta_final_recommendation
+where material_id = 1815319
+%sql
+select business_day,sum(amount)/sum(quantity) as price,sum(quantity) as total_qty
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-04-20' and current_date
+and product_id = 1815319
+and region_name = 'DUBAI'
+group by all
+%sql
+select *,expected_price - accepted_price as diff
+from analytics.pricing.accepted_recommendation_info_new
+%sql
+with cte as 
+(
+  select weekofyear(business_day),sum(amount)/sum(quantity) as price
+  from gold.transaction.uae_pos_transactions pos 
+  join gold.store.store_master sm 
+  on sm.store_id = pos.store_id
+  where business_day between '2025-04-27' and '2025-07-20'
+  and product_id = 1685342
+  and region_name = 'DUBAI'
+  and ean = 6294011643484
+  group by all
+-- 1076445	SHARJAH
+)
+
+
+select avg(price)
+from cte
+%sql
+with cte as 
+(
+select business_day,sum(quantity),sum(amount)/sum(quantity) as price
+from gold.transaction.uae_pos_transactions pos 
+left join gold.store.store_master sm 
+on pos.store_id = sm.store_id 
+left join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between '2025-04-20' and current_date
+-- and material_group_name in ('CANOLA OIL')
+and brand ilike '%lulu%'
+and  product_id = 1891606
+
+
+  AND region_name ='ABU DHABI'
+and ean in (select distinct ean_final from dev.sandbox.av_all_ean where material_id = 1891606
+
+)
+and amount >0
+and bulk_sale_flag is null 
+and quantity >0
+and transaction_type in ('SALE','SELL_MEDIA')
+group by all
+)
+
+select *
+from cte
+%sql
+
+select avg(unit_price_derived),sum(total_sales)/sum(total_qty)
+from dev.sandbox.av_promo_tag tag
+WHERE  business_day between '2025-04-27' and '2025-08-02'
+and material_id = 2158611
+ AND region_name = 'DUBAI'
+  and period_type = 'pre_period'
+  group by all
+
+%sql
+with region_wise as
+(
+select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+from dev.sandbox.pricing_measurement_raw_txn_data rd
+left join dev.sandbox.pg_uae_holiday_list hl
+on rd.business_day = hl.holiday_date
+
+
+group by all
+)
+,base AS (
+SELECT
+*,
+case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) AS past_price,
+(ROUND(total_sales / NULLIF(total_qty,0), 2) /
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) - 1) AS change_percentage
+FROM region_wise
+-- WHERE material_id = 1815319
+-- AND region_name = 'DUBAI'
+),
+direction_flag AS (
+SELECT *,
+CASE
+WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+END AS price_direction
+FROM base
+),
+
+events AS (
+SELECT
+region_name, material_id, business_day, price_direction,period_type,
+ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+FROM direction_flag
+WHERE price_direction IS NOT NULL
+),
+
+
+max_inc_day AS (
+
+  select 
+    *,
+    case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+  from events
+),
+
+valid_pairs AS (
+SELECT *,
+DATEDIFF(max_inc_day_new, business_day) AS gap
+FROM max_inc_day
+WHERE DATEDIFF(max_inc_day_new, business_day) < 20
+AND price_direction = 'Decrease'
+)
+
+,final as
+(
+SELECT
+b.*,
+CASE
+WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+ON b.region_name = vp.region_name
+AND b.material_id = vp.material_id
+-- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+AND b.business_day >= vp.business_day 
+AND b.business_day <= vp.max_inc_day_new
+left join dev.sandbox.av_promo_identified pi
+on pi.material_id = b.material_id
+and pi.region_name = b.region_name
+and b.business_day between pi.actual_start_date and pi.actual_end_date
+)
+
+select 
+distinct * 
+from final
+WHERE material_id = 2158662
+
+  AND region_name = 'ABU DHABI'
+%sql
+create or replace table dev.sandbox.export
+select vd.*,fr.Current_12W_Price_in_POS as pre_price_observed, fr.Final_recommnedation as recommended_price,avg_unit_price_derived_pre - Current_12W_Price_in_POS as diff
+from dev.sandbox.av_exploration_ex vd 
+join gold.material.material_master mm 
+on vd.material_id = mm.material_id
+join analytics.pricing.seta_final_recommendation fr 
+on fr.material_id = vd.material_id 
+and fr.region_name = vd.region_name
+where test_violation_flag = 0
+order by diff asc
+%sql
+select * ,expected_price- accepted_price as diff
+from analytics.pricing.seta_accepted_recommendation_info
+df = spark.sql("""
+WITH cte AS (
+    SELECT 
+        category_name,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-04-20' AND '2024-08-02'
+      AND (material_group_name, category_name,region_name) IN (
+            SELECT DISTINCT material_group_name, category_name ,region_name
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY category_name,region_name,business_day
+),
+cte1 AS (
+    SELECT 
+        category_name,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-08-14' AND MAKE_DATE(2024, EXTRACT(MONTH FROM CURRENT_DATE)::INT, EXTRACT(DAY FROM CURRENT_DATE)::INT)
+      AND (material_group_name, category_name,region_name) IN (
+            SELECT DISTINCT material_group_name, category_name,region_name
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY category_name,region_name, business_day
+),
+avg1 AS (
+    SELECT category_name,region_name, AVG(qty) AS avg_qty_period1
+    FROM cte
+    GROUP BY category_name,region_name
+),
+avg2 AS (
+    SELECT category_name,region_name, AVG(qty) AS avg_qty_period2
+    FROM cte1
+    GROUP BY category_name,region_name
+)
+SELECT 
+    COALESCE(a1.category_name, a2.category_name) AS category_name,
+    a1.region_name,
+    a1.avg_qty_period1,
+    a2.avg_qty_period2,
+    CASE 
+        WHEN a1.avg_qty_period1 = 0 THEN NULL
+        ELSE ROUND((a2.avg_qty_period2 /a1.avg_qty_period1), 2)
+    END AS cat_growth_pct
+FROM avg1 a1
+FULL OUTER JOIN avg2 a2 
+    ON a1.category_name = a2.category_name
+    and a1.region_name = a2.region_name
+ORDER BY cat_growth_pct DESC""")
+
+
+# df.display()
+agg_final1 = agg_final.merge(df.toPandas(), on=['category_name','region_name'], how='left')
+
+agg_final1.display()
+df = spark.sql("""
+WITH cte AS (
+    SELECT 
+        material_group_name,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-04-20' AND '2024-08-02'
+      AND (material_group_name, category_name,region_name) IN (
+            SELECT DISTINCT material_group_name, category_name ,region_name
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY material_group_name,region_name,business_day
+),
+cte1 AS (
+    SELECT 
+        material_group_name,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-08-14' AND MAKE_DATE(2024, EXTRACT(MONTH FROM CURRENT_DATE)::INT, EXTRACT(DAY FROM CURRENT_DATE)::INT)
+      AND (material_group_name, category_name,region_name) IN (
+            SELECT DISTINCT material_group_name, category_name,region_name
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY material_group_name,region_name, business_day
+),
+avg1 AS (
+    SELECT material_group_name,region_name, AVG(qty) AS avg_qty_period1
+    FROM cte
+    GROUP BY material_group_name,region_name
+),
+avg2 AS (
+    SELECT material_group_name,region_name, AVG(qty) AS avg_qty_period2
+    FROM cte1
+    GROUP BY material_group_name,region_name
+)
+SELECT 
+    COALESCE(a1.material_group_name, a2.material_group_name) AS material_group_name,
+    a1.region_name,
+    a1.avg_qty_period1,
+    a2.avg_qty_period2,
+    CASE 
+        WHEN a1.avg_qty_period1 = 0 THEN NULL
+        ELSE ROUND((a2.avg_qty_period2 /a1.avg_qty_period1), 2)
+    END AS mg_growth_pct
+FROM avg1 a1
+FULL OUTER JOIN avg2 a2 
+    ON a1.material_group_name = a2.material_group_name
+    and a1.region_name = a2.region_name
+ORDER BY mg_growth_pct DESC""")
+
+
+# df.display()
+agg_final1 = agg_final1.merge(df.toPandas(), on=['material_group_name','region_name'], how='left')
+
+df = spark.sql("""
+WITH cte AS (
+    SELECT 
+        material_group_name,
+        material_id,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-04-20' AND '2024-08-02'
+      AND (material_group_name, category_name,region_name,material_id) IN (
+            SELECT DISTINCT material_group_name, category_name ,region_name,material_id
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY material_group_name,region_name,business_day,material_id
+),
+cte1 AS (
+    SELECT 
+        material_group_name,
+        material_id,
+        region_name,
+        business_day,
+        SUM(quantity) AS qty
+    FROM gold.transaction.uae_pos_transactions pos 
+    JOIN gold.material.material_master mm 
+        ON pos.product_id = mm.material_id
+    join gold.store.store_master sm 
+    on sm.store_id = pos.store_id
+    LEFT ANTI JOIN dev.sandbox.pg_uae_holiday_list uh 
+        ON uh.holiday_date = pos.business_day
+    WHERE business_day BETWEEN '2024-08-14' AND MAKE_DATE(2024, EXTRACT(MONTH FROM CURRENT_DATE)::INT, EXTRACT(DAY FROM CURRENT_DATE)::INT)
+      AND (material_group_name, category_name,region_name,material_id) IN (
+            SELECT DISTINCT material_group_name, category_name,region_name,material_id
+            FROM dev.sandbox.av_all_ean
+          )
+      AND brand ILIKE '%lulu%'
+      AND amount > 0
+      AND quantity > 0
+      AND bulk_sale_flag IS NULL
+    GROUP BY material_group_name,region_name, business_day,material_id
+),
+avg1 AS (
+    SELECT material_group_name,region_name,material_id, AVG(qty) AS avg_qty_period1
+    FROM cte
+    GROUP BY material_group_name,region_name,material_id
+),
+avg2 AS (
+    SELECT material_group_name,region_name,material_id, AVG(qty) AS avg_qty_period2
+    FROM cte1
+    GROUP BY material_group_name,region_name,material_id
+)
+SELECT 
+    COALESCE(a1.material_id, a2.material_id) AS material_id,
+    a1.region_name,
+    a1.material_id,
+    a1.avg_qty_period1,
+    a2.avg_qty_period2,
+    CASE 
+        WHEN a1.avg_qty_period1 = 0 THEN NULL
+        ELSE ROUND((a2.avg_qty_period2 /a1.avg_qty_period1), 2)
+    END AS mat_growth_pct
+FROM avg1 a1
+FULL OUTER JOIN avg2 a2 
+    ON a1.material_id = a2.material_id
+    and a1.region_name = a2.region_name
+ORDER BY mat_growth_pct DESC""")
+
+
+df.display()
+# agg_final1 = agg_final1.merge(df.toPandas(), on=['material_id','region_name'], how='left')
+
+%sql
+with cte as 
+(
+select business_day,sum(quantity),sum(amount)/sum(quantity) as price
+from gold.transaction.uae_pos_transactions pos 
+left join gold.store.store_master sm 
+on pos.store_id = sm.store_id 
+left join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where business_day between '2024-04-20' and current_date
+-- and material_group_name in ('CANOLA OIL')
+and brand ilike '%lulu%'
+and  product_id = 2032587
+
+
+  AND region_name ='AL AIN'
+--and ean in (select distinct ean_final from dev.sandbox.av_all_ean where material_id = 2032587)
+and amount >0
+and bulk_sale_flag is null 
+and quantity >0
+and transaction_type in ('SALE','SELL_MEDIA')
+group by all
+)
+
+select *
+from cte
+spark.createDataFrame(agg_final1).write.option('overwriteSchema',True).mode('overwrite').saveAsTable('dev.sandbox.av_exploration_ex')
+%sql
+select * from dev.sandbox.av_exploration_ex
+%sql
+select Price_Direction,count(distinct Material_Region) as pair
+from analytics.pricing.setb_final_recommendation fr
+group by all
+%sql
+select *
+from analytics.pricing.setb_final_recommendation fr
+group by all
+%sql
+select * 
+from dev.sandbox.all_violation_df
+%sql
+select * 
+from dev.sandbox.av_promo_tag
+where material_id = 1575389
+and region_name = 'ABU DHABI'
+%sql
+with cte as 
+(
+select business_day,sum(quantity),sum(amount)/sum(quantity) as price
+from gold.transaction.uae_pos_transactions pos 
+left join gold.store.store_master sm 
+on pos.store_id = sm.store_id 
+left join gold.material.material_master mm 
+on mm.material_id = pos.product_id
+where (business_day between '2025-04-20' and '2025-07-20'
+or business_day between '2025-08-04' and current_date)
+-- and material_group_name in ('CANOLA OIL')
+and brand ilike '%lulu%'
+and  product_id = 1575389
+
+
+  AND region_name ='ABU DHABI'
+and ean in (select distinct ean_final from dev.sandbox.av_all_ean where material_id = 1575389)
+and amount >0
+and bulk_sale_flag is null 
+and quantity >0
+and transaction_type in ('SALE','SELL_MEDIA')
+group by all
+)
+
+select *
+from cte
+%sql
+with region_wise as
+(
+select period_type,material_id,business_day,region_name,material_group_name,sum(num_txn) as num_txn,round(sum(total_sales),2) as total_sales,sum(total_qty) as total_qty,round(avg(rd.avg_regular_unit_price),2) as avg_regular_unit_price,max(case when hl.holiday_date is not null then 1 else 0 end) as holiday
+from dev.sandbox.pricing_measurement_raw_txn_data rd
+left join dev.sandbox.pg_uae_holiday_list hl
+on rd.business_day = hl.holiday_date
+
+
+group by all
+)
+,base AS (
+SELECT
+*,
+case when day(business_day) in (27,28,29,30,31,1,2,3,4,5) then 'PAY DAY' else 'NON PAY DAY' end as week_type,
+ROUND(total_sales / NULLIF(total_qty,0), 2) AS unit_price_derived,
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) AS past_price,
+(ROUND(total_sales / NULLIF(total_qty,0), 2) /
+LAG(ROUND(total_sales / NULLIF(total_qty,0), 2)) OVER (
+PARTITION BY region_name, material_id
+ORDER BY business_day
+) - 1) AS change_percentage
+FROM region_wise
+-- WHERE material_id = 1815319
+-- AND region_name = 'DUBAI'
+),
+direction_flag AS (
+SELECT *,
+CASE
+WHEN period_type = 'pre_period' and change_percentage > 0.05 THEN 'Increase'
+WHEN period_type = 'pre_period' and change_percentage < -0.08 THEN 'Decrease'
+END AS price_direction
+FROM base
+),
+
+events AS (
+SELECT
+region_name, material_id, business_day, price_direction,period_type,
+ROW_NUMBER() OVER (PARTITION BY region_name, material_id ORDER BY business_day) AS rn,
+MIN(CASE WHEN price_direction = 'Increase' THEN business_day END) OVER (PARTITION BY region_name, material_id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS max_inc_day1
+FROM direction_flag
+WHERE price_direction IS NOT NULL
+),
+
+
+max_inc_day AS (
+
+  select 
+    *,
+    case when max_inc_day1 is NULL then max(business_day) over() else max_inc_day1 end as max_inc_day_new
+  from events
+),
+
+valid_pairs AS (
+SELECT *,
+DATEDIFF(max_inc_day_new, business_day) AS gap
+FROM max_inc_day
+WHERE DATEDIFF(max_inc_day_new, business_day) <= 21
+AND price_direction = 'Decrease'
+)
+
+,final as
+(
+SELECT
+b.*,
+CASE
+WHEN vp.material_id IS NOT NULL or pi.material_id is not null THEN 1 ELSE 0
+END AS promo_flag
+FROM base b
+LEFT JOIN valid_pairs vp
+ON b.region_name = vp.region_name
+AND b.material_id = vp.material_id
+-- AND b.business_day BETWEEN vp.dec_day AND vp.inc_day
+AND b.business_day >= vp.business_day 
+AND b.business_day <= vp.max_inc_day_new
+left join dev.sandbox.av_promo_identified pi
+on pi.material_id = b.material_id
+and pi.region_name = b.region_name
+and b.business_day between pi.actual_start_date and pi.actual_end_date
+)
+
+select 
+distinct * 
+from final
+-- where material_id = 1685342 AND region_name = 'DUBAI'
+-- where promo_flag = 0
+-- and holiday = 0
+--where promo_flag = 0
+--and holiday = 0
+where material_id = 1575389
+and region_name = 'ABU DHABI'
+%sql
+select period_type,count(*)
+from dev.sandbox.av_promo_tag
+where material_id = 1575389
+and region_name = 'ABU DHABI'
+group by all 
+%sql
+select business_day,sum(pos.quantity)
+from gold.transaction.uae_pos_transactions pos 
+where business_day between '2025-10-07' and current_date 
+and product_id = 375317
+and store_id = 2380
+and bulk_sale_flag is null
+and amount >0
+and transaction_type in ('SALE','SELL_MEDIA')
+group by all
+%sql
+select business_day,sum(amount)/sum(quantity) as price,sum(quantity) as total_qty
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id
+where business_day between '2025-04-20' and current_date
+and product_id = 375317
+and region_name = 'DUBAI'
+group by all
+%sql
+select program_name,price_change_direction,count(*) as total_pairs,count(distinct case when incremental_profit >0 then concat(material_id,region_name) end) as pairs,count(distinct case when incremental_profit >0 then concat(material_id,region_name) end)/count(*) as perc
+from dev.sandbox.all_violation_df
+group by all
+%sql
+desc  dev.sandbox.all_violation_df
+%sql
+SELECT 
+    program_name,
+    COUNT(*) AS pairs,
+    SUM(CASE 
+            WHEN price_change_direction = 'Increase' 
+                 AND df.avg_unit_price_derived_pre > df.avg_test_unit_price_derived 
+            THEN 1 ELSE 0 
+        END) AS incr_pairs,
+    SUM(CASE 
+            WHEN price_change_direction = 'Decrease' 
+                 AND df.avg_unit_price_derived_pre < df.avg_test_unit_price_derived 
+            THEN 1 ELSE 0 
+        END) AS decr_pairs
+FROM dev.sandbox.all_violation_df df
+GROUP BY program_name;
+
+%sql
+select * 
+from dev.sandbox.all_violation_df
+%sql
+select business_day,sum(amount)/sum(quantity) as price,sum(pos.quantity) as sales
+from gold.transaction.uae_pos_transactions pos 
+join gold.store.store_master sm 
+on sm.store_id = pos.store_id 
+where business_day between '2025-01-01' and current_date
+and region_name = 'SHARJAH'
+and product_id = 701105
+group by all
