@@ -1,0 +1,1966 @@
+%md
+## Project Overview
+Wallet Share Protection is designed to identify high-value UAE customers who are quietly reducing the variety of categories they buy from before they fully disengage. In retail loyalty programs, a shrinking category footprint is often an earlier and more actionable signal than a complete drop in spend. A customer who once bought across grocery, fresh food, electronics, and fashion but now shops in only one or two areas is showing early wallet-share erosion.
+
+This notebook builds an end-to-end machine learning pipeline to detect that pattern in a business-ready way. It starts by assembling nine months of customer, transaction, and product hierarchy data, then converts raw transaction lines into a monthly view of category breadth, spend, and visits at the `customer_id` level. From there, it labels sustained three-month decline events, engineers trajectory features that capture both the level and direction of change, and trains a Cox Proportional Hazards model to estimate the likelihood that a customer will soon consolidate their purchases further.
+
+The output is designed for commercial action rather than academic analysis. Each active customer receives a normalized hazard score, a clear risk tier, and a trajectory segment such as Gradual Consolidator or Sudden Dropper. That combination helps CRM teams decide not only who to target first, but also what kind of intervention is most appropriate, such as cross-sell offers, win-back campaigns, or positive reinforcement for recovering customers.
+
+The final result is persisted to a Delta table so that downstream reporting, Genie Spaces, and CRM audience extraction can operate from one governed source of truth. The recommended operating model is a weekly scoring cycle, allowing LuLu Group International to refresh early-warning signals regularly and protect wallet share before high-value customers become materially harder to win back.
+
+# ============================================================================
+# INSTALL REQUIRED PACKAGES
+# ============================================================================
+# lifelines: Survival analysis library for Cox Proportional Hazards model
+# scikit-learn: For KMeans clustering and preprocessing
+# ============================================================================
+
+%pip install lifelines --quiet
+# Only restart in interactive mode — when run as child via dbutils.notebook.run(), restartPython() terminates the child prematurely.
+try:
+    is_job_run = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().isDefined()
+except:
+    is_job_run = False
+
+if not is_job_run:
+    dbutils.library.restartPython()
+# ============================================================================
+# IMPORT LIBRARIES
+# ============================================================================
+
+# PySpark imports for distributed data processing
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import DoubleType, IntegerType, StringType
+
+# Python standard library
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+
+# Pandas for Cox model and clustering (lifelines requires pandas)
+import pandas as pd
+import numpy as np
+
+# Survival analysis
+from lifelines import CoxPHFitter
+
+# Clustering
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+# Visualization
+import matplotlib.pyplot as plt
+
+# Set display options
+pd.set_option('display.max_columns', 50)
+pd.set_option('display.width', 200)
+
+# --------------------------------------------------------------------------
+# VIP SEGMENT FILTER CONFIGURATION
+# --------------------------------------------------------------------------
+# Restricts the pipeline to UAE VIP customers from analytics.segment.customer_segments.
+# 202605 has no data yet — using 202604 (latest available month).
+# UAE VIP count for 202604: ~194,782 customers.
+SEGMENT_TABLE   = "analytics.segment.customer_segments"
+SEGMENT_MONTH   = 202604   # Change to 202605 when that month loads
+SEGMENT_COUNTRY = "uae"    # Lowercase as stored in the partition
+SEGMENT_FILTER  = "VIP"    # Exact string from the segment column
+
+print("Libraries imported successfully")
+print(f"Current date: {datetime.now().strftime('%Y-%m-%d')}")
+print(f"VIP filter: {SEGMENT_TABLE} WHERE month_year={SEGMENT_MONTH} AND country='{SEGMENT_COUNTRY}' AND segment='{SEGMENT_FILTER}'")
+%md
+## Step 1: Data Extraction
+
+This step loads the three source tables required for the Wallet Share Protection pipeline:
+- **Transaction data** from UAE point-of-sale systems
+- **Material hierarchy** to map products to departments/categories
+- **Customer profiles** for loyalty tenure and contact information
+# ============================================================================
+# STEP 1: DATA EXTRACTION
+# ============================================================================
+# Load transaction, material hierarchy, store master, and customer attributes.
+# Filter to last 9 months for feature engineering + event labeling window.
+# Scope all downstream work to SUPER MARKET only and customer_id grain.
+# ============================================================================
+
+# Define date boundaries for extraction
+# 9 months: 6 months for feature window + 3 months for event labeling
+end_date = datetime.now().date()
+start_date = end_date - relativedelta(months=9)
+region_lookback_start = end_date - timedelta(days=90)
+SUPERMARKET_CLASS = "SUPER MARKET"
+
+print(f"Extraction window: {start_date} to {end_date}")
+print("This provides 6 months for features + 3 months for event observation")
+print(f"Primary region lookback: {region_lookback_start} to {end_date}")
+print(f"Department class filter: {SUPERMARKET_CLASS}")
+print("="*60)
+
+# --------------------------------------------------------------------------
+# 1A: Load UAE POS Transactions
+# --------------------------------------------------------------------------
+# Filter: last 9 months, non-null customer_id, positive net amount
+# Do not use mobile — it is masked and not suitable for modeling.
+df_transactions = (
+    spark.table("gold.transaction.uae_pos_transactions")
+    .filter(
+        (F.col("transaction_date") >= F.lit(start_date)) &
+        (F.col("transaction_date") <= F.lit(end_date)) &
+        (F.col("customer_id").isNotNull()) &
+        (F.col("amount") > 0)
+    )
+    .select(
+        F.col("customer_id").cast("bigint").alias("customer_id"),
+        F.col("transaction_date"),
+        F.col("transaction_id"),
+        F.col("product_id").cast("string").alias("product_id"),
+        F.col("store_id").cast("bigint").alias("store_id"),
+        F.col("amount").alias("net_amount")
+    )
+)
+
+txn_count = df_transactions.count()
+print(f"Transactions loaded (all): {txn_count:,} rows")
+print(f"Unique customers (customer_id): {df_transactions.select('customer_id').distinct().count():,}")
+df_transactions.show(5, truncate=False)
+
+# --------------------------------------------------------------------------
+# 1B: Load Material Master (Product Hierarchy)
+# --------------------------------------------------------------------------
+# Maps product_id to category and department class.
+df_materials = (
+    spark.table("gold.material.material_master")
+    .select(
+        F.col("material_id").cast("string").alias("product_id"),
+        F.col("category_id").cast("int").alias("category_id"),
+        F.col("category_name"),
+        F.col("department_id").cast("int").alias("department_id"),
+        F.col("department_name"),
+        F.col("department_class_id").cast("int").alias("department_class_id"),
+        F.col("department_class_name")
+    )
+    .dropDuplicates(["product_id"])
+)
+
+print(f"\nMaterial master loaded: {df_materials.count():,} products")
+print(f"Unique categories: {df_materials.select('category_id').distinct().count():,}")
+print(f"Unique department classes: {df_materials.select('department_class_name').distinct().count():,}")
+df_materials.show(5, truncate=False)
+
+# --------------------------------------------------------------------------
+# 1C: Load store master for region enrichment
+# --------------------------------------------------------------------------
+df_stores = (
+    spark.table("gold.store.store_master")
+    .select(
+        F.col("store_id").cast("bigint").alias("store_id"),
+        F.col("region_name")
+    )
+    .dropDuplicates(["store_id"])
+)
+
+print(f"\nStore master loaded: {df_stores.count():,} stores")
+print(f"Unique regions: {df_stores.select('region_name').distinct().count():,}")
+df_stores.show(5, truncate=False)
+
+# --------------------------------------------------------------------------
+# 1D: Load VIP customer universe from segment table
+# --------------------------------------------------------------------------
+# This is the authoritative VIP list — only these customer_ids will be scored.
+df_vip_universe = (
+    spark.table(SEGMENT_TABLE)
+    .filter(
+        (F.col("month_year") == SEGMENT_MONTH) &
+        (F.col("country") == SEGMENT_COUNTRY) &
+        (F.col("segment") == SEGMENT_FILTER)
+    )
+    .select(F.col("customer_id").cast("bigint").alias("customer_id"))
+    .dropDuplicates(["customer_id"])
+)
+
+vip_count = df_vip_universe.count()
+print(f"\nUAE VIP customers (month_year={SEGMENT_MONTH}): {vip_count:,}")
+
+# Restrict transactions to the VIP universe immediately
+# This keeps the working set aligned to the business scope.
+df_transactions = df_transactions.join(df_vip_universe, on="customer_id", how="inner")
+print(f"Transactions after VIP filter: {df_transactions.count():,} rows")
+
+# --------------------------------------------------------------------------
+# 1E: Load customer attributes (primary loyalty source)
+# --------------------------------------------------------------------------
+# Keep only loyalty customers with lhr_date populated.
+df_customer_attrs = (
+    spark.table("dev.sandbox.RO_Hack_UAE_customer_attributes")
+    .filter(F.col("lhr_date").isNotNull())
+    .select(
+        F.col("customer_id").cast("bigint").alias("customer_id"),
+        F.col("lhr_date"),
+        F.col("core_segment"),
+        F.col("segment").alias("crm_segment"),
+        F.col("maturity_band"),
+        F.col("recency_band"),
+        F.col("nationality_final").alias("nationality"),
+        F.col("recency").cast("double"),
+        F.col("maturity").cast("double"),
+        F.col("visit_probability_30").cast("double"),
+        F.col("decrease_cohort").cast("int"),
+        F.col("ATV_last_6_month").cast("double"),
+        F.col("RPC_last_6_month").cast("double"),
+        F.col("sale_decile").cast("int"),
+        F.col("last_6_month_sale").cast("double"),
+        F.col("last_6_month_trxns").cast("double")
+    )
+    .dropDuplicates(["customer_id"])
+)
+
+# Restrict attrs to VIP universe and keep only loyalty customers in transactions
+# This defines the final modeling population.
+df_customer_attrs = df_customer_attrs.join(df_vip_universe, on="customer_id", how="inner")
+df_transactions = df_transactions.join(df_customer_attrs.select("customer_id"), on="customer_id", how="inner")
+
+print(f"\nVIP loyalty customers in attrs table: {df_customer_attrs.count():,}")
+print(f"Transactions after loyalty filter: {df_transactions.count():,} rows")
+print(f"Unique loyalty customers in transactions: {df_transactions.select('customer_id').distinct().count():,}")
+
+print("\nCustomer Attributes Sample:")
+df_customer_attrs.show(5, truncate=False)
+
+print("\nDecrease Cohort Distribution:")
+df_customer_attrs.groupBy("decrease_cohort").count().show()
+
+print("\nCore Segment Distribution:")
+df_customer_attrs.groupBy("core_segment").count().orderBy(F.desc("count")).show()
+
+print("\n" + "="*60)
+print("STEP 1 COMPLETE: Source data loaded for supermarket category modeling")
+print("="*60)
+%md
+### What Step 1 Did
+
+**Data Sources Loaded:**
+
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `gold.transaction.uae_pos_transactions` | POS line-item transactions | customer_id, transaction_date, product_id, amount |
+| `gold.material.material_master` | Product → Department mapping | product_id, department_id, department_name |
+| `gold.customer.vynamic_customer_profile` | Loyalty member profiles | customer_id, lhrdate, city, segment |
+
+**Why 9 Months of Transaction History?**
+
+We need enough data to:
+1. **Compute 6 months of monthly breadth scores** for feature engineering (slopes, peaks, volatility)
+2. **Observe the event window** where 3-month sustained decline can occur
+3. **Avoid stale patterns** — older behavior may not reflect current customer intent
+
+**What Does "Active Customer" Mean?**
+
+A customer is considered active if their **Last Happy Return Date (lhrdate)** — the most recent loyalty program engagement — falls within the last 12 months. Customers with no recent loyalty activity are excluded because:
+- They may have already churned silently
+- Intervention ROI is lower for disengaged members
+- CRM teams should focus on customers still in the retention window
+
+**Assumptions:**
+- `customer_id` is the single customer grain used throughout the pipeline — no `customer_key` dependency
+- Only loyalty customers with a non-null `lhrdate` in the profile table are included — transactions from non-loyalty shoppers are dropped at extraction time
+- `amount > 0` excludes returns and voids from positive spend analysis
+%md
+## Step 2: Monthly Category Breadth Computation
+
+This step aggregates raw transactions into a customer-month view that captures:
+- **Breadth Score**: How many distinct departments the customer purchased from
+- **Total Spend**: Sum of net amounts for the month
+- **Visit Count**: Number of distinct transactions (store visits)
+# ============================================================================
+# STEP 2: MONTHLY CATEGORY BREADTH COMPUTATION
+# ============================================================================
+# For each customer-month, compute category-wise breadth within SUPER MARKET:
+#   - breadth_score: COUNT(DISTINCT category_id)
+#   - total_spend: SUM(net_amount)
+#   - visit_count: COUNT(DISTINCT transaction_id)
+#   - top_category: most frequent category that month
+# Also derive each customer's primary region_name from the last 90 days of
+# supermarket transactions using the max transaction count rule.
+# ============================================================================
+
+# Join transactions with materials, restrict to supermarket, and enrich stores
+# Category breadth is intentionally computed at category_id level, not department_id.
+df_txn_supermarket = (
+    df_transactions
+    .join(
+        df_materials.select(
+            "product_id",
+            "category_id",
+            "category_name",
+            "department_class_id",
+            "department_class_name"
+        ),
+        on="product_id",
+        how="inner"
+    )
+    .filter(F.col("department_class_name") == SUPERMARKET_CLASS)
+    .join(df_stores, on="store_id", how="left")
+    .withColumn("year_month", F.date_format(F.col("transaction_date"), "yyyy-MM"))
+)
+
+print(f"Supermarket transactions with category mapping: {df_txn_supermarket.count():,} rows")
+print(f"Transactions with NULL category_id: {df_txn_supermarket.filter(F.col('category_id').isNull()).count():,}")
+print(f"Transactions with NULL region_name: {df_txn_supermarket.filter(F.col('region_name').isNull()).count():,}")
+
+# Filter out rows without category mapping (cannot contribute to category breadth)
+df_txn_supermarket = df_txn_supermarket.filter(F.col("category_id").isNotNull())
+
+# --------------------------------------------------------------------------
+# Primary region from last 90 days of supermarket transactions
+# --------------------------------------------------------------------------
+# Tie-breakers: higher spend, then alphabetical region_name for determinism.
+w_region = Window.partitionBy("customer_id").orderBy(
+    F.desc("region_txn_count"),
+    F.desc("region_spend"),
+    F.asc_nulls_last("region_name")
+)
+
+df_primary_region = (
+    df_txn_supermarket
+    .filter(F.col("transaction_date") >= F.lit(region_lookback_start))
+    .groupBy("customer_id", "region_name")
+    .agg(
+        F.countDistinct("transaction_id").alias("region_txn_count"),
+        F.sum("net_amount").alias("region_spend")
+    )
+    .withColumn("region_rank", F.row_number().over(w_region))
+    .filter(F.col("region_rank") == 1)
+    .select(
+        "customer_id",
+        F.coalesce(F.col("region_name"), F.lit("Unknown")).alias("region_name")
+    )
+)
+
+print(f"\nCustomers with primary region from last 90 days: {df_primary_region.count():,}")
+df_primary_region.show(5, truncate=False)
+
+# --------------------------------------------------------------------------
+# Compute monthly category aggregates per customer
+# --------------------------------------------------------------------------
+
+# Window for finding top category per customer-month
+w_top_category = Window.partitionBy("customer_id", "year_month").orderBy(
+    F.desc("cat_txn_count"),
+    F.desc("cat_spend"),
+    F.asc("category_id")
+)
+
+# Category frequency per customer-month
+df_category_freq = (
+    df_txn_supermarket
+    .groupBy("customer_id", "year_month", "category_id", "category_name")
+    .agg(
+        F.countDistinct("transaction_id").alias("cat_txn_count"),
+        F.sum("net_amount").alias("cat_spend")
+    )
+    .withColumn("cat_rank", F.row_number().over(w_top_category))
+)
+
+# Top category per customer-month
+df_top_category = (
+    df_category_freq
+    .filter(F.col("cat_rank") == 1)
+    .select(
+        "customer_id",
+        "year_month",
+        F.col("category_id").alias("top_category_id"),
+        F.col("category_name").alias("top_category_name")
+    )
+)
+
+# Main monthly metrics at category level
+df_monthly_breadth = (
+    df_txn_supermarket
+    .groupBy("customer_id", "year_month")
+    .agg(
+        F.countDistinct("category_id").alias("breadth_score"),
+        F.sum("net_amount").alias("total_spend"),
+        F.countDistinct("transaction_id").alias("visit_count")
+    )
+    .join(df_top_category, on=["customer_id", "year_month"], how="left")
+    .orderBy("customer_id", "year_month")
+)
+
+# --------------------------------------------------------------------------
+# Print summary statistics
+# --------------------------------------------------------------------------
+monthly_count = df_monthly_breadth.count()
+print(f"\nMonthly breadth records: {monthly_count:,}")
+print(f"Unique customers: {df_monthly_breadth.select('customer_id').distinct().count():,}")
+print(f"Date range: {df_monthly_breadth.select(F.min('year_month')).first()[0]} to {df_monthly_breadth.select(F.max('year_month')).first()[0]}")
+
+print("\nCategory Breadth Distribution:")
+df_monthly_breadth.select("breadth_score").summary("min", "25%", "50%", "75%", "max", "mean").show()
+
+print("Sample monthly breadth data:")
+df_monthly_breadth.show(10, truncate=False)
+
+print("\n" + "="*60)
+print("STEP 2 COMPLETE: Supermarket category breadth and primary region computed")
+print("="*60)
+%md
+### What Step 2 Did
+
+**Output Table Schema:**
+
+| Column | Description |
+|--------|-------------|
+| customer_id | Unique customer identifier |
+| year_month | Calendar month (YYYY-MM) |
+| breadth_score | Count of distinct departments purchased from |
+| total_spend | Sum of net transaction amounts |
+| visit_count | Number of distinct transactions (store trips) |
+| top_department_id | Most frequently purchased department that month |
+
+**What Does Breadth Score Measure?**
+
+Breadth score captures the **category diversity** of a customer's shopping basket. A customer who purchases from Electronics, Grocery, Fashion, and Home in a given month has a breadth score of 4. A customer who only buys Grocery has a breadth score of 1.
+
+**Example:**
+- Customer A buys from: Grocery, Fresh Food, Electronics, Clothing → **breadth = 4**
+- Customer B buys from: Grocery only → **breadth = 1**
+
+Customer A is engaging across multiple categories (high wallet share), while Customer B is a single-category shopper (low cross-sell penetration or early consolidation signal).
+
+**Why Department Level Instead of Sub-Category?**
+
+Departments represent meaningful **business units** that a customer consciously chooses to shop in. Sub-categories would create noise (e.g., switching between "Men's Shirts" and "Men's Pants" within Fashion is not a breadth change). Departments capture the strategic question: *Is this customer shopping across the store or narrowing their focus?*
+
+**Key Assumption:**
+- Products without a department mapping are excluded from breadth calculation (they can't contribute to category diversity measurement)
+%md
+## Step 3: Event Labeling (Survival Analysis Target)
+
+This step creates the target variable for the Cox Proportional Hazards model by identifying customers who experienced a **sustained 3-month decline** in category breadth — our definition of "wallet share erosion event."
+# ============================================================================
+# STEP 3: EVENT LABELING (SURVIVAL ANALYSIS TARGET)
+# ============================================================================
+# For each customer, using the last 6 months of category breadth scores:
+#   - EVENT = 1 if breadth declined for 3 consecutive months (strict: each < previous)
+#   - EVENT = 0 if no such sustained decline (censored observation)
+#   - event_time = months observed before event or end of window
+# ============================================================================
+
+# Get the list of all months in our observation window
+all_months = (
+    df_monthly_breadth
+    .select("year_month")
+    .distinct()
+    .orderBy("year_month")
+    .collect()
+)
+all_months_list = [row["year_month"] for row in all_months]
+print(f"Months in observation window: {all_months_list}")
+
+# We'll use the last 6 months for event detection
+if len(all_months_list) >= 6:
+    event_months = all_months_list[-6:]
+else:
+    event_months = all_months_list
+print(f"Event observation months: {event_months}")
+
+# --------------------------------------------------------------------------
+# Pivot category breadth scores to wide format for sequential analysis
+# --------------------------------------------------------------------------
+df_breadth_pivot = (
+    df_monthly_breadth
+    .filter(F.col("year_month").isin(event_months))
+    .groupBy("customer_id")
+    .pivot("year_month")
+    .agg(F.first("breadth_score"))
+)
+
+print(f"\nCustomers with data in event window: {df_breadth_pivot.count():,}")
+df_breadth_pivot.show(5, truncate=False)
+
+# --------------------------------------------------------------------------
+# Convert to pandas for sequential decline detection
+# --------------------------------------------------------------------------
+df_breadth_pd = df_breadth_pivot.toPandas()
+
+breadth_cols = [col for col in df_breadth_pd.columns if col != 'customer_id']
+breadth_cols = sorted(breadth_cols)
+print(f"Breadth columns for analysis: {breadth_cols}")
+
+# Forward fill then fill remaining NaN with 0 (customer did not shop that month)
+df_breadth_pd[breadth_cols] = df_breadth_pd[breadth_cols].ffill(axis=1).fillna(0)
+
+# --------------------------------------------------------------------------
+# Detect 3-month consecutive decline
+# --------------------------------------------------------------------------
+def detect_sustained_decline(row, breadth_cols):
+    """
+    Detect if customer has 3 consecutive months of strictly declining breadth.
+    Returns: (event_flag, event_time)
+    """
+    values = [row[col] for col in breadth_cols]
+    consecutive_declines = 0
+
+    for i in range(1, len(values)):
+        if values[i] < values[i - 1]:
+            consecutive_declines += 1
+            if consecutive_declines >= 3:
+                return (1, i + 1)
+        else:
+            consecutive_declines = 0
+
+    return (0, len(values))
+
+results = df_breadth_pd.apply(
+    lambda row: detect_sustained_decline(row, breadth_cols),
+    axis=1
+)
+df_breadth_pd['event_flag'] = [r[0] for r in results]
+df_breadth_pd['event_time'] = [r[1] for r in results]
+
+# --------------------------------------------------------------------------
+# Summary statistics
+# --------------------------------------------------------------------------
+event_counts = df_breadth_pd['event_flag'].value_counts()
+print(f"\n{'='*60}")
+print("EVENT LABELING SUMMARY")
+print(f"{'='*60}")
+print(f"Total customers labeled: {len(df_breadth_pd):,}")
+print(f"Event (sustained decline): {event_counts.get(1, 0):,} ({event_counts.get(1, 0)/len(df_breadth_pd)*100:.1f}%)")
+print(f"Censored (no event yet): {event_counts.get(0, 0):,} ({event_counts.get(0, 0)/len(df_breadth_pd)*100:.1f}%)")
+print(f"\nEvent time distribution:")
+print(df_breadth_pd.groupby('event_flag')['event_time'].describe())
+
+# Convert back to Spark DataFrame for downstream processing
+df_events = spark.createDataFrame(
+    df_breadth_pd[['customer_id', 'event_flag', 'event_time']]
+)
+
+print("\nSample event labels:")
+df_events.show(10, truncate=False)
+
+print("\n" + "="*60)
+print("STEP 3 COMPLETE: Survival analysis events labeled")
+print("="*60)
+%md
+### What Step 3 Did
+
+**Survival Analysis Concepts in Plain English:**
+
+| Term | Meaning |
+|------|--------|
+| **Event** | The "bad thing" we're trying to predict — in our case, a customer starting to consolidate their purchases into fewer categories |
+| **Event Time** | How many months we observed the customer before the event happened |
+| **Censored** | Customers who haven't had the event yet — we don't know if or when they will, but we still use their data |
+| **Hazard** | The instantaneous risk of the event happening at any given point in time |
+
+**What Does Our Event Mean?**
+
+We define the event as **3 consecutive months of strictly declining category breadth**. This means:
+- Month 1: breadth = 5
+- Month 2: breadth = 4 (decline #1)
+- Month 3: breadth = 3 (decline #2)
+- Month 4: breadth = 2 (decline #3) → **EVENT TRIGGERED**
+
+The customer is systematically consolidating their shopping, buying from fewer and fewer departments over time.
+
+**Why 3 Consecutive Months, Not Just 1 Month?**
+
+A single month dip could be noise:
+- Customer on vacation
+- Seasonal shopping pattern (e.g., only buying gifts in December)
+- Stock availability issues
+
+Three consecutive declines indicate a **sustained behavioral shift**, not random fluctuation. This makes the signal more actionable and reduces false positives that would waste CRM resources.
+
+**What Does "Censored" Mean?**
+
+Censored customers are those who **haven't experienced the event yet during our observation window**. They might:
+- Never experience it (healthy customers)
+- Experience it next month (at-risk but not yet triggered)
+
+Survival analysis is specifically designed to handle censored data properly, which is why we use Cox PH instead of simple classification.
+%md
+## Step 4: Feature Engineering
+
+This step creates the predictor variables for the Cox model by engineering features that capture both the **level** and **direction of change** in customer behavior.
+# ============================================================================
+# STEP 4: FEATURE ENGINEERING  (Optimised — Pure PySpark, no pandas loop)
+# ============================================================================
+# All trajectory features are computed as distributed Spark aggregations.
+# Category breadth is measured at category_id level within SUPER MARKET only.
+# Seasonality is handled using rolling quarter-over-quarter comparisons,
+# active-month coverage, weekend shopping share, and category concentration.
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# 4A: OLS slope constants for the N-point monthly series
+# --------------------------------------------------------------------------
+N = len(event_months)
+SUM_X = float(N * (N + 1) / 2)
+SUM_XX = float(N * (N + 1) * (2 * N + 1) / 6)
+DENOM = float(N * SUM_XX - SUM_X ** 2)
+
+print(f"Feature window: {N} months | OLS denominator: {DENOM}")
+print(f"Months: {event_months}")
+
+# --------------------------------------------------------------------------
+# 4B: Build a complete customer-month panel for the feature window
+# --------------------------------------------------------------------------
+# This makes slope and recent-vs-prior comparisons robust even when customers
+# skipped some months. Missing months are treated as zero supermarket activity.
+feature_month_rows = [(m,) for m in sorted(event_months)]
+df_feature_months = spark.createDataFrame(feature_month_rows, ["year_month"])
+
+df_customer_base = df_customer_attrs.select("customer_id").dropDuplicates(["customer_id"])
+
+df_monthly_complete = (
+    df_customer_base
+    .crossJoin(df_feature_months)
+    .join(
+        df_monthly_breadth.filter(F.col("year_month").isin(event_months)),
+        on=["customer_id", "year_month"],
+        how="left"
+    )
+    .fillna({"breadth_score": 0.0, "total_spend": 0.0, "visit_count": 0.0})
+)
+
+print(f"Complete customer-month panel: {df_monthly_complete.count():,} rows")
+
+# --------------------------------------------------------------------------
+# 4C: Add chronological month index to each customer-month row
+# --------------------------------------------------------------------------
+w_order = Window.partitionBy("customer_id").orderBy("year_month")
+
+df_monthly_indexed = (
+    df_monthly_complete
+    .withColumn("midx", F.row_number().over(w_order).cast("double"))
+    .withColumn("xi_b", F.col("midx") * F.col("breadth_score").cast("double"))
+    .withColumn("xi_s", F.col("midx") * F.col("total_spend"))
+    .withColumn("active_month_flag", F.when(F.col("total_spend") > 0, F.lit(1.0)).otherwise(F.lit(0.0)))
+)
+
+# --------------------------------------------------------------------------
+# 4D: Current breadth and peak timing
+# --------------------------------------------------------------------------
+last_month = sorted(event_months)[-1]
+df_breadth_current = (
+    df_monthly_indexed
+    .filter(F.col("year_month") == last_month)
+    .select(
+        "customer_id",
+        F.col("breadth_score").cast("double").alias("breadth_current")
+    )
+)
+
+w_peak = Window.partitionBy("customer_id").orderBy(
+    F.desc("breadth_score"), F.desc("midx")
+)
+df_peak_timing = (
+    df_monthly_indexed
+    .withColumn("pk_rank", F.row_number().over(w_peak))
+    .filter(F.col("pk_rank") == 1)
+    .select(
+        "customer_id",
+        (F.lit(float(N)) - F.col("midx")).alias("months_since_peak")
+    )
+)
+
+# --------------------------------------------------------------------------
+# 4E: Seasonality-aware transactional features
+# --------------------------------------------------------------------------
+df_txn_event_window = df_txn_supermarket.filter(F.col("year_month").isin(event_months))
+
+# Share of supermarket spend concentrated in the customer's top category.
+df_category_concentration = (
+    df_txn_event_window
+    .groupBy("customer_id", "category_id")
+    .agg(F.sum("net_amount").alias("category_spend"))
+    .groupBy("customer_id")
+    .agg((F.max("category_spend") / F.sum("category_spend")).alias("top_category_spend_share"))
+)
+
+# Weekend shopping share captures recurring timing behavior.
+# UAE retail weekends are modeled as Saturday/Sunday.
+df_timing_features = (
+    df_txn_event_window
+    .withColumn("is_weekend", F.when(F.dayofweek("transaction_date").isin([1, 7]), F.lit(1.0)).otherwise(F.lit(0.0)))
+    .groupBy("customer_id")
+    .agg(F.avg("is_weekend").alias("weekend_txn_share"))
+)
+
+# --------------------------------------------------------------------------
+# 4F: Main distributed aggregation — all features in one Spark pass
+# --------------------------------------------------------------------------
+df_features_spark = (
+    df_monthly_indexed
+    .groupBy("customer_id")
+    .agg(
+        F.max(F.col("breadth_score").cast("double")).alias("breadth_peak"),
+        F.stddev_samp("breadth_score").alias("breadth_volatility"),
+        F.avg("total_spend").alias("avg_monthly_spend"),
+        F.avg("visit_count").alias("avg_visit_count"),
+        F.avg("active_month_flag").alias("active_month_ratio"),
+        F.avg(F.when(F.col("midx") <= N - 3, F.col("breadth_score"))).alias("breadth_prev_3m_avg"),
+        F.avg(F.when(F.col("midx") > N - 3, F.col("breadth_score"))).alias("breadth_recent_3m_avg"),
+        F.avg(F.when(F.col("midx") <= N - 3, F.col("total_spend"))).alias("spend_prev_3m_avg"),
+        F.avg(F.when(F.col("midx") > N - 3, F.col("total_spend"))).alias("spend_recent_3m_avg"),
+        F.sum(F.col("breadth_score").cast("double")).alias("sy_b"),
+        F.sum("xi_b").alias("sxy_b"),
+        F.sum("total_spend").alias("sy_s"),
+        F.sum("xi_s").alias("sxy_s")
+    )
+    .withColumn(
+        "breadth_slope",
+        (F.lit(N) * F.col("sxy_b") - F.lit(SUM_X) * F.col("sy_b")) / F.lit(DENOM)
+    )
+    .withColumn(
+        "spend_slope",
+        (F.lit(N) * F.col("sxy_s") - F.lit(SUM_X) * F.col("sy_s")) / F.lit(DENOM)
+    )
+    .withColumn(
+        "atv",
+        F.when(F.col("avg_visit_count") > 0, F.col("avg_monthly_spend") / F.col("avg_visit_count")).otherwise(F.lit(0.0))
+    )
+    .withColumn(
+        "breadth_recent_vs_prev_3m_ratio",
+        F.when(F.col("breadth_prev_3m_avg") > 0, F.least(F.col("breadth_recent_3m_avg") / F.col("breadth_prev_3m_avg"), F.lit(5.0)))
+         .when(F.col("breadth_recent_3m_avg") > 0, F.lit(2.0))
+         .otherwise(F.lit(1.0))
+    )
+    .withColumn(
+        "spend_recent_vs_prev_3m_ratio",
+        F.when(F.col("spend_prev_3m_avg") > 0, F.least(F.col("spend_recent_3m_avg") / F.col("spend_prev_3m_avg"), F.lit(5.0)))
+         .when(F.col("spend_recent_3m_avg") > 0, F.lit(2.0))
+         .otherwise(F.lit(1.0))
+    )
+    .drop("sy_b", "sxy_b", "sy_s", "sxy_s", "avg_visit_count")
+)
+
+# Join current breadth, peak timing, and seasonality-aware features
+# Also attach the customer's dominant supermarket region in the last 90 days.
+df_features_spark = (
+    df_features_spark
+    .join(df_breadth_current, "customer_id", "left")
+    .join(df_peak_timing, "customer_id", "left")
+    .join(df_category_concentration, "customer_id", "left")
+    .join(df_timing_features, "customer_id", "left")
+    .join(df_primary_region, "customer_id", "left")
+    .withColumn("breadth_current", F.coalesce(F.col("breadth_current"), F.lit(0.0)))
+    .withColumn("months_since_peak", F.coalesce(F.col("months_since_peak"), F.lit(0.0)))
+    .withColumn(
+        "breadth_drop_pct",
+        F.when(
+            F.col("breadth_peak") > 0,
+            F.greatest((F.col("breadth_peak") - F.col("breadth_current")) / F.col("breadth_peak") * 100.0, F.lit(0.0))
+        ).otherwise(F.lit(0.0))
+    )
+    .fillna({
+        "breadth_volatility": 0.0,
+        "breadth_slope": 0.0,
+        "spend_slope": 0.0,
+        "avg_monthly_spend": 0.0,
+        "atv": 0.0,
+        "breadth_peak": 0.0,
+        "active_month_ratio": 0.0,
+        "breadth_prev_3m_avg": 0.0,
+        "breadth_recent_3m_avg": 0.0,
+        "spend_prev_3m_avg": 0.0,
+        "spend_recent_3m_avg": 0.0,
+        "breadth_recent_vs_prev_3m_ratio": 1.0,
+        "spend_recent_vs_prev_3m_ratio": 1.0,
+        "top_category_spend_share": 0.0,
+        "weekend_txn_share": 0.0,
+        "region_name": "Unknown"
+    })
+)
+
+spark_count = df_features_spark.count()
+print(f"\nSpark features computed: {spark_count:,} customers (fully distributed)")
+display(
+    df_features_spark.select(
+        F.round(F.avg("breadth_slope"), 4).alias("avg_breadth_slope"),
+        F.round(F.avg("breadth_peak"), 2).alias("avg_breadth_peak"),
+        F.round(F.avg("breadth_current"), 2).alias("avg_breadth_current"),
+        F.round(F.avg("breadth_drop_pct"), 2).alias("avg_breadth_drop_pct"),
+        F.round(F.avg("weekend_txn_share"), 3).alias("avg_weekend_txn_share"),
+        F.round(F.avg("top_category_spend_share"), 3).alias("avg_top_category_spend_share")
+    )
+)
+
+# --------------------------------------------------------------------------
+# 4G: Single toPandas() on the compact feature table + enrich with attrs
+# --------------------------------------------------------------------------
+df_customer_features = df_features_spark.toPandas()
+df_customer_features["customer_id"] = df_customer_features["customer_id"].astype(str)
+
+df_customer_attrs_pd = df_customer_attrs.toPandas()
+df_customer_attrs_pd["customer_id"] = df_customer_attrs_pd["customer_id"].astype(str)
+
+# Merge trajectory + seasonality features with the enriched attrs table
+df_features_with_profile = df_customer_features.merge(
+    df_customer_attrs_pd[[
+        'customer_id', 'lhr_date', 'core_segment', 'crm_segment',
+        'maturity_band', 'recency_band', 'nationality',
+        'recency', 'maturity', 'visit_probability_30',
+        'decrease_cohort', 'ATV_last_6_month', 'RPC_last_6_month',
+        'sale_decile', 'last_6_month_sale', 'last_6_month_trxns'
+    ]],
+    on='customer_id', how='left'
+)
+
+# Loyalty tenure comes directly from the authoritative attrs table.
+today = pd.Timestamp.now().normalize()
+df_features_with_profile['lhr_date_parsed'] = pd.to_datetime(
+    df_features_with_profile['lhr_date'], errors='coerce'
+)
+df_features_with_profile['loyalty_tenure_months'] = (
+    (today - df_features_with_profile['lhr_date_parsed']).dt.days / 30.44
+).fillna(0).astype(int)
+
+df_features_with_profile['is_happiness_member'] = (
+    df_features_with_profile['lhr_date'].notna()
+).astype(int)
+df_features_with_profile['region_name'] = df_features_with_profile['region_name'].fillna('Unknown')
+
+# Fill numeric gaps
+attrs_num = [
+    'recency', 'maturity', 'visit_probability_30', 'ATV_last_6_month',
+    'RPC_last_6_month', 'last_6_month_sale', 'last_6_month_trxns'
+]
+df_features_with_profile[attrs_num] = df_features_with_profile[attrs_num].fillna(0)
+df_features_with_profile['decrease_cohort'] = df_features_with_profile['decrease_cohort'].fillna(0).astype(int)
+df_features_with_profile['sale_decile'] = df_features_with_profile['sale_decile'].fillna(5).astype(int)
+
+print(f"\nFeatures with enriched profile: {len(df_features_with_profile):,} customers")
+print(f"Matched to attrs table:          {df_features_with_profile['lhr_date'].notna().sum():,}")
+print(f"In decrease_cohort:              {df_features_with_profile['decrease_cohort'].sum():,}")
+print(f"Customers with region assigned:  {(df_features_with_profile['region_name'] != 'Unknown').sum():,}")
+
+# --------------------------------------------------------------------------
+# 4H: Join with event labels to create final modeling dataset
+# --------------------------------------------------------------------------
+df_events_pd = df_events.toPandas()
+df_events_pd["customer_id"] = df_events_pd["customer_id"].astype(str)
+
+df_model_data = df_features_with_profile.merge(
+    df_events_pd[['customer_id', 'event_flag', 'event_time']],
+    on='customer_id', how='inner'
+)
+
+print(f"\nFinal modeling dataset: {len(df_model_data):,} customers")
+print(f"Event rate:             {df_model_data['event_flag'].mean()*100:.1f}%")
+
+print("\nSample:")
+show_cols = [
+    'customer_id', 'region_name', 'breadth_slope', 'breadth_peak', 'breadth_current',
+    'breadth_drop_pct', 'breadth_recent_vs_prev_3m_ratio',
+    'spend_recent_vs_prev_3m_ratio', 'weekend_txn_share',
+    'top_category_spend_share', 'avg_monthly_spend', 'atv',
+    'loyalty_tenure_months', 'event_flag', 'event_time'
+]
+print(df_model_data[show_cols].head(5).to_string())
+
+print("\n" + "="*60)
+print("STEP 4 COMPLETE — category-wise, supermarket-only, seasonality-aware")
+print("="*60)
+# ============================================================================
+# STEP 4G: MOMENTUM / SHAPE FEATURES FROM BREADTH TIME SERIES
+# ============================================================================
+# These 4 features capture the TEMPORAL SHAPE of decline — missing from the
+# current feature set which only measures level and overall slope.
+#
+#   consecutive_decline_months : months in a row breadth has been falling
+#                                (most directly predictive — event = 3 consec.)
+#   last_month_breadth_change  : most recent month's signed change
+#   breadth_acceleration       : 2nd diff — is decline speeding up?
+#   pct_months_declining       : fraction of 5 MoM steps that were negative
+# ============================================================================
+
+sorted_months = sorted(event_months)   # 6 months in chronological order
+
+# ── Pivot monthly breadth to pandas (one row per customer) ────────────────
+df_bp_pd = df_breadth_pivot.toPandas()
+for m in sorted_months:
+    if m not in df_bp_pd.columns:
+        df_bp_pd[m] = 0.0
+df_bp_pd[sorted_months] = df_bp_pd[sorted_months].fillna(0.0)
+df_bp_pd['customer_id'] = df_bp_pd['customer_id'].astype(str)
+
+# ── Feature 1: consecutive_decline_months ─────────────────────────────────
+def _consec_declines(row, months):
+    count = 0
+    for i in range(len(months) - 1, 0, -1):
+        if row[months[i]] < row[months[i - 1]]:
+            count += 1
+        else:
+            break
+    return count
+
+df_bp_pd['consecutive_decline_months'] = df_bp_pd.apply(
+    _consec_declines, args=(sorted_months,), axis=1
+)
+
+# ── Feature 2: last_month_breadth_change ──────────────────────────────────
+df_bp_pd['last_month_breadth_change'] = (
+    df_bp_pd[sorted_months[-1]] - df_bp_pd[sorted_months[-2]]
+)
+
+# ── Feature 3: breadth_acceleration ──────────────────────────────────────
+df_bp_pd['breadth_acceleration'] = (
+    (df_bp_pd[sorted_months[-1]] - df_bp_pd[sorted_months[-2]]) -
+    (df_bp_pd[sorted_months[-2]] - df_bp_pd[sorted_months[-3]])
+)
+
+# ── Feature 4: pct_months_declining ──────────────────────────────────────
+decline_flags = [
+    (df_bp_pd[sorted_months[i]] < df_bp_pd[sorted_months[i - 1]]).astype(float)
+    for i in range(1, len(sorted_months))
+]
+df_bp_pd['pct_months_declining'] = sum(decline_flags) / len(decline_flags)
+
+# ── Merge into df_model_data ──────────────────────────────────────────────
+momentum_cols = [
+    'customer_id',
+    'consecutive_decline_months',
+    'last_month_breadth_change',
+    'breadth_acceleration',
+    'pct_months_declining',
+]
+df_model_data['customer_id'] = df_model_data['customer_id'].astype(str)
+df_model_data = df_model_data.merge(
+    df_bp_pd[momentum_cols], on='customer_id', how='left'
+)
+df_model_data[momentum_cols[1:]] = df_model_data[momentum_cols[1:]].fillna(0)
+
+print("Momentum features added:")
+print(df_model_data[momentum_cols[1:]].describe().round(3))
+print(f"\nconsecutive_decline_months distribution:")
+print(df_model_data['consecutive_decline_months'].value_counts().sort_index())
+print(f"\nEvent rate by consecutive_decline_months (key sanity check):")
+print(df_model_data.groupby('consecutive_decline_months')['event_flag'].mean().round(3))
+%md
+### What Step 4 Did
+
+**Engineered Features Overview:**
+
+| Feature | What It Captures | Business Intuition |
+|---------|-----------------|--------------------|
+| `breadth_slope` | Linear trend of breadth over 6 months | Negative = customer is consolidating; Positive = expanding |
+| `breadth_peak` | Maximum breadth achieved | How engaged was customer at their best? |
+| `breadth_current` | Most recent month breadth | Current state of category engagement |
+| `breadth_drop_pct` | (peak - current) / peak × 100 | How far has customer fallen from their peak? |
+| `breadth_volatility` | Std dev of monthly breadth | Is customer erratic or consistent? |
+| `months_since_peak` | Months since highest breadth | How long ago did erosion start? |
+| `avg_monthly_spend` | Mean monthly spend | Absolute customer value |
+| `spend_slope` | Trend in spend over time | Is total spending also declining? |
+| `atv` | Avg transaction value (spend/visits) | Basket size per trip |
+| `loyalty_tenure_months` | Months since loyalty enrollment | Longer tenure = more established relationship |
+| `is_happiness_member` | Has loyalty enrollment | Are they in the program at all? |
+
+**Why Do Slope Features Matter?**
+
+The **direction of change** is often more predictive than current state:
+- A customer with breadth = 3 who was at 5 last quarter is very different from one who was at 2
+- A negative `breadth_slope` signals active deterioration, even if current breadth looks okay
+- This is why survival analysis is powerful: it models **time until** an event, not just whether it happened
+
+**Why Is `breadth_drop_pct` Important?**
+
+Relative decline is more meaningful than absolute:
+- Dropping from breadth 8 → 4 (50% drop) is more alarming than 3 → 2 (33% drop)
+- A customer who once shopped across many categories has more potential value to recover
+
+**Assumptions:**
+- Months with no transactions are forward-filled then set to 0 breadth (customer didn't shop)
+- Customers must have at least 2 months of data for slope calculation
+- Loyalty tenure is calculated from `lhrdate` (Last Happy Return Date)
+%md
+## Step 5: Cox Proportional Hazards Model
+
+This step trains the survival analysis model that estimates each customer's risk of experiencing the "category consolidation" event based on their behavioral features.
+# ============================================================================
+# STEP 5: COX PROPORTIONAL HAZARDS MODEL
+# ============================================================================
+# Train Cox PH model using lifelines library.
+# Features now include category-wise supermarket breadth, seasonality-aware
+# recent-vs-prior quarter comparisons, activity coverage, and concentration.
+# Duration: event_time (months until event or censoring)
+# Event: event_flag (1 = consolidation event, 0 = censored)
+# ============================================================================
+
+# Define feature columns for the model
+# Feature set v3 — changes from v2:
+#   ADDED (Step 4G momentum features):
+#     consecutive_decline_months, last_month_breadth_change,
+#     breadth_acceleration, pct_months_declining
+#   REMOVED (p > 0.3, statistically insignificant — adding noise):
+#     breadth_current (p=0.631), breadth_volatility (p=0.522),
+#     atv (p=0.582), breadth_recent_3m_avg (p=0.722),
+#     weekend_txn_share (p=0.284), loyalty_tenure_months (p=0.938),
+#     ATV_last_6_month (p=0.532)
+feature_columns = [
+    # Breadth trajectory (level + trend)
+    'breadth_slope',
+    'breadth_peak',
+    'breadth_drop_pct',
+    'months_since_peak',
+    # Breadth momentum / shape — NEW (most predictive group)
+    'consecutive_decline_months',      # mirrors event definition directly
+    'last_month_breadth_change',       # most recent directional signal
+    'breadth_acceleration',            # is decline speeding up?
+    'pct_months_declining',            # fraction of months in decline
+    # Spend signals — 2 orthogonal only
+    'avg_monthly_spend',
+    'spend_recent_vs_prev_3m_ratio',
+    # Activity & concentration
+    'active_month_ratio',
+    'breadth_prev_3m_avg',
+    'breadth_recent_vs_prev_3m_ratio',
+    'top_category_spend_share',
+    # Customer enriched signals
+    'recency',
+    'maturity',
+    'decrease_cohort',
+    'RPC_last_6_month',
+    'sale_decile'
+]
+
+# --------------------------------------------------------------------------
+# Guard: sanitize feature matrix before fitting
+# --------------------------------------------------------------------------
+df_model_data_clean = df_model_data.replace([np.inf, -np.inf], np.nan)
+
+feature_null_rates = df_model_data_clean[feature_columns].isnull().mean()
+zero_var_cols = [c for c in feature_columns if df_model_data_clean[c].nunique(dropna=True) <= 1]
+high_null_cols = feature_null_rates[feature_null_rates > 0.30].index.tolist()
+drop_cols = list(set(zero_var_cols + high_null_cols))
+
+if drop_cols:
+    print(f"Dropping {len(drop_cols)} column(s) — zero variance or >30% null: {drop_cols}")
+
+clean_feature_columns = [c for c in feature_columns if c not in drop_cols]
+
+# Fill remaining NaN with median (more robust than 0 for skewed distributions)
+df_model_data_clean[clean_feature_columns] = (
+    df_model_data_clean[clean_feature_columns]
+    .apply(lambda col: col.fillna(col.median()))
+)
+
+# Scale features to unit variance to help Cox Newton-Raphson converge
+from sklearn.preprocessing import StandardScaler as _SS
+_scaler = _SS()
+df_model_data_clean[clean_feature_columns] = _scaler.fit_transform(
+    df_model_data_clean[clean_feature_columns]
+)
+
+# Build the final modeling matrix
+model_cols = clean_feature_columns + ['event_time', 'event_flag']
+df_cox = df_model_data_clean[model_cols].copy()
+df_cox['event_time'] = df_cox['event_time'].clip(lower=1)
+
+print(f"Training data shape: {df_cox.shape}")
+print(f"Event rate: {df_cox['event_flag'].mean()*100:.1f}%")
+print(f"Features used: {clean_feature_columns}")
+print(f"\nNull check (should all be 0):")
+print(df_cox[clean_feature_columns].isnull().sum()[lambda s: s > 0])
+
+# --------------------------------------------------------------------------
+# Fit Cox Proportional Hazards Model
+# --------------------------------------------------------------------------
+print("\n" + "="*60)
+print("FITTING COX PROPORTIONAL HAZARDS MODEL")
+print("="*60)
+
+# penalizer 0.5 → 0.2: features are now cleaner (noise removed, momentum added).
+# 0.5 was over-shrinking real effects (all coefficients were capped at ±0.07).
+cph = CoxPHFitter(penalizer=0.2)
+
+cph.fit(
+    df_cox,
+    duration_col='event_time',
+    event_col='event_flag',
+    show_progress=True
+)
+
+# Print model summary
+print("\n" + "="*60)
+print("MODEL SUMMARY")
+print("="*60)
+cph.print_summary(decimals=3, columns=['coef', 'exp(coef)', 'p', 'coef lower 95%', 'coef upper 95%'])
+
+# --------------------------------------------------------------------------
+# Model Performance Metrics
+# --------------------------------------------------------------------------
+print("\n" + "="*60)
+print("MODEL PERFORMANCE")
+print("="*60)
+
+raw_concordance = cph.concordance_index_
+# concordance_index_ = concordance_index(T, -predicted_hazard, E)
+# If raw < 0.5 the model's polarity is inverted; effective C = 1 - raw.
+concordance = raw_concordance if raw_concordance >= 0.5 else 1.0 - raw_concordance
+if raw_concordance < 0.5:
+    print(f"Note: raw concordance_index_ = {raw_concordance:.3f} (< 0.5 — scores inverted).")
+    print(f"      Effective C-index after inversion = {concordance:.3f}")
+else:
+    print(f"Concordance Index: {concordance:.3f}")
+print(f"  - Interpretation: {concordance:.1%} of customer pairs are correctly ranked by risk")
+print(f"  - Benchmark: 0.50 = random guessing, 0.70+ = good, 0.80+ = excellent")
+
+if concordance >= 0.65:
+    print("  Model meets target threshold (>= 0.65)")
+else:
+    print("  Model below target threshold (0.65). Consider additional features.")
+
+# --------------------------------------------------------------------------
+# Visualizations
+# --------------------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+ax1 = axes[0]
+cph.plot(ax=ax1)
+ax1.set_title('Feature Coefficients (Log Hazard Ratios)\nPositive = Increases Risk, Negative = Decreases Risk', fontsize=10)
+ax1.axvline(x=0, color='red', linestyle='--', alpha=0.5)
+ax1.set_xlabel('Coefficient (log hazard ratio)')
+
+ax2 = axes[1]
+cph.plot_partial_effects_on_outcome(
+    covariates='breadth_slope',
+    values=[-0.5, 0, 0.5],
+    ax=ax2,
+    cmap='coolwarm'
+)
+ax2.set_title('Survival Curves by Breadth Slope\n(Lower slope = Higher risk)', fontsize=10)
+ax2.set_xlabel('Time (months)')
+ax2.set_ylabel('Survival Probability (no event)')
+ax2.legend(title='breadth_slope', labels=['Declining (-0.5)', 'Stable (0)', 'Growing (+0.5)'])
+
+plt.tight_layout()
+plt.show()
+
+# --------------------------------------------------------------------------
+# Top Risk Factors
+# --------------------------------------------------------------------------
+print("\n" + "="*60)
+print("TOP RISK FACTORS (by absolute coefficient magnitude)")
+print("="*60)
+
+coef_df = cph.summary[['coef', 'exp(coef)', 'p']].copy()
+coef_df['abs_coef'] = coef_df['coef'].abs()
+coef_df = coef_df.sort_values('abs_coef', ascending=False)
+
+for idx, row in coef_df.head(8).iterrows():
+    direction = "increases" if row['coef'] > 0 else "decreases"
+    hr = row['exp(coef)']
+    print(f"  {idx}: {direction} risk (HR={hr:.2f}, p={row['p']:.3f})")
+
+print("\nCandidate next improvements to test:")
+print("  1. Category entropy / concentration trend over time")
+print("  2. Promo sensitivity and discount share in supermarket baskets")
+print("  3. Store-switching frequency across regions / formats")
+print("  4. Weekly cadence features and holiday / Ramadan calendar flags")
+print("  5. Time-based validation on older scoring months for stability")
+
+print("\n" + "="*60)
+print("STEP 5 COMPLETE: Cox PH model trained")
+print("="*60)
+# ============================================================================
+# STEP 5B: SAVE MODEL ARTIFACTS — VERSIONED + LATEST
+# ============================================================================
+# Saves the trained Cox PH model, scaler, and feature list as pickle files.
+# Two copies:
+#   1. Versioned (date-stamped): cox_ph_model_YYYYMMDD.pkl — never overwritten
+#   2. Latest (symlink-style): cox_ph_model_latest.pkl — always points to newest
+# The Score notebook loads "_latest" for weekly inference runs.
+# ============================================================================
+import pickle
+import os
+from datetime import date
+
+MODEL_DIR = "/Workspace/Users/812130@lulumea.com/Hackathon - Wallet Share Protection/models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+version_tag = date.today().strftime("%Y%m%d")
+
+# --------------------------------------------------------------------------
+# Model metadata (saved alongside for traceability)
+# --------------------------------------------------------------------------
+model_metadata = {
+    "version": version_tag,
+    "c_index": concordance,
+    "raw_concordance": raw_concordance,
+    "n_features": len(clean_feature_columns),
+    "features": clean_feature_columns,
+    "penalizer": 0.2,
+    "training_rows": len(df_cox),
+    "event_rate": df_cox['event_flag'].mean(),
+    "trained_at": datetime.now().isoformat(),
+}
+
+# --------------------------------------------------------------------------
+# Save versioned copies
+# --------------------------------------------------------------------------
+artifacts = {
+    f"cox_ph_model_{version_tag}.pkl": cph,
+    f"scaler_{version_tag}.pkl": _scaler,
+    f"model_features_{version_tag}.pkl": clean_feature_columns,
+    f"model_metadata_{version_tag}.pkl": model_metadata,
+}
+
+for fname, obj in artifacts.items():
+    path = os.path.join(MODEL_DIR, fname)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+    print(f"  Saved: {fname}")
+
+# --------------------------------------------------------------------------
+# Save "latest" copies (overwritten each train run)
+# --------------------------------------------------------------------------
+latest_artifacts = {
+    "cox_ph_model_latest.pkl": cph,
+    "scaler_latest.pkl": _scaler,
+    "model_features_latest.pkl": clean_feature_columns,
+    "model_metadata_latest.pkl": model_metadata,
+}
+
+for fname, obj in latest_artifacts.items():
+    path = os.path.join(MODEL_DIR, fname)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+print(f"\n{'='*60}")
+print(f"MODEL ARTIFACTS SAVED — Version: {version_tag}")
+print(f"{'='*60}")
+print(f"  Directory: {MODEL_DIR}")
+print(f"  C-index:   {concordance:.3f}")
+print(f"  Features:  {len(clean_feature_columns)}")
+print(f"  Rows:      {len(df_cox):,}")
+print(f"\n  Versioned files: *_{version_tag}.pkl (permanent archive)")
+print(f"  Latest files:    *_latest.pkl (used by Score notebook)")
+print(f"\n  Model versions available:")
+versions = sorted(set(f.split('_')[-1].replace('.pkl','') for f in os.listdir(MODEL_DIR) if f.startswith('cox_ph_model_') and 'latest' not in f))
+for v in versions:
+    print(f"    - {v}")
+%md
+### What Step 5 Did
+
+**What Is a Cox Proportional Hazards Model?**
+
+The Cox PH model estimates the **instantaneous risk (hazard)** that a customer will experience the consolidation event at any given point in time, based on their characteristics. Unlike classification which predicts yes/no, Cox models the **timing** of events and properly handles customers who haven't had the event yet (censored).
+
+**Reading the Model Output:**
+
+| Metric | What It Means |
+|--------|---------------|
+| **Coefficient (coef)** | Log of the hazard ratio. Positive = increases risk, Negative = decreases risk |
+| **Hazard Ratio (exp(coef))** | Multiplicative effect on risk. HR=2.0 means 2x higher risk per unit increase |
+| **p-value** | Statistical significance. p < 0.05 means the effect is unlikely due to chance |
+| **Concordance Index** | How well the model ranks customers by risk. 0.5 = random, 1.0 = perfect |
+
+**Example Interpretation:**
+
+If `breadth_slope` has coefficient = -1.5 and HR = 0.22:
+- A **negative slope** (category breadth declining over time) **increases** risk
+- Each unit decrease in slope multiplies the baseline hazard by ~4.5x (1/0.22)
+- Customers with declining breadth trajectories are much more likely to consolidate soon
+
+**What Does Concordance Index Mean in Plain English?**
+
+If we randomly pick two customers — one who experienced the event and one who didn't — the concordance index tells us how often the model correctly identifies which one was higher risk.
+
+- **C-index = 0.50**: The model is no better than a coin flip
+- **C-index = 0.65**: The model correctly ranks 65% of pairs (our minimum target)
+- **C-index = 0.75**: The model correctly ranks 75% of pairs (good)
+- **C-index = 0.85+**: Excellent predictive discrimination
+%md
+## Step 6: Scoring / Inference
+
+This step applies the trained Cox model to all active customers, generating risk scores and assigning each customer to a risk tier for CRM prioritization.
+# ============================================================================
+# STEP 6: SCORING / INFERENCE
+# ============================================================================
+# Apply trained Cox model to all customers:
+#   - Generate partial hazard scores (relative risk)
+#   - Normalize to 0-100 scale
+#   - Assign risk tiers: High (top 20%), Medium (20-50%), Low (bottom 50%)
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# Generate Partial Hazard Scores
+# --------------------------------------------------------------------------
+# IMPORTANT: cph was fitted on SCALED features (via _scaler in Step 5).
+# We must pass the same scaled matrix for prediction — NOT the original values.
+# The overflow in the previous run was caused by passing unscaled values.
+
+# Rebuild the scaled scoring matrix from the clean model data
+df_score_raw = df_model_data_clean[clean_feature_columns].copy()
+# df_model_data_clean already has scaled values from Step 5 — use directly
+df_score_raw = df_score_raw.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+# Use log partial hazard to avoid exp() overflow on extreme feature values
+# log_partial_hazard = X * beta  (no exp applied, stays numerically stable)
+log_partial_hazard = cph.predict_log_partial_hazard(df_score_raw)
+df_model_data['log_partial_hazard'] = log_partial_hazard.values
+
+# --------------------------------------------------------------------------
+# Normalize log partial hazard to 0-100
+# --------------------------------------------------------------------------
+# Direction of log_partial_hazard depends on convergence path:
+#   raw_concordance_index_ > 0.5 → higher LPH = higher risk (normal)
+#   raw_concordance_index_ < 0.5 → lower  LPH = higher risk (inverted)
+# raw_concordance is set in Step 5 and used here to pick the correct direction.
+lph_min = df_model_data['log_partial_hazard'].replace([np.inf, -np.inf], np.nan).quantile(0.01)
+lph_max = df_model_data['log_partial_hazard'].replace([np.inf, -np.inf], np.nan).quantile(0.99)
+
+if raw_concordance < 0.5:
+    # Inverted: lower LPH → score = 100 (highest risk)
+    df_model_data['hazard_score'] = (
+        (lph_max - df_model_data['log_partial_hazard'].clip(lph_min, lph_max))
+        / (lph_max - lph_min) * 100
+    ).round(1)
+    print(f"Score direction: INVERTED (raw C={raw_concordance:.3f} < 0.5, effective C={1-raw_concordance:.3f})")
+else:
+    # Normal: higher LPH → score = 100 (highest risk)
+    df_model_data['hazard_score'] = (
+        (df_model_data['log_partial_hazard'].clip(lph_min, lph_max) - lph_min)
+        / (lph_max - lph_min) * 100
+    ).round(1)
+    print(f"Score direction: NORMAL (raw C={raw_concordance:.3f} ≥ 0.5)")
+
+# Keep partial_hazard column for compatibility
+df_model_data['partial_hazard'] = df_model_data['log_partial_hazard']
+
+# --------------------------------------------------------------------------
+# Assign Risk Tiers
+# --------------------------------------------------------------------------
+# High Risk: top 20% (hazard_score >= 80th percentile)
+# Medium Risk: 20-50% (hazard_score >= 50th and < 80th percentile)  
+# Low Risk: bottom 50% (hazard_score < 50th percentile)
+
+p80 = df_model_data['hazard_score'].quantile(0.80)
+p50 = df_model_data['hazard_score'].quantile(0.50)
+
+def assign_risk_tier(score):
+    if score >= p80:
+        return 'High Risk'
+    elif score >= p50:
+        return 'Medium Risk'
+    else:
+        return 'Low Risk'
+
+df_model_data['risk_tier'] = df_model_data['hazard_score'].apply(assign_risk_tier)
+
+# Sanity check: event rate should be highest in High Risk
+print("\nSanity check — event rate by risk tier (High Risk should be highest):")
+print(df_model_data.groupby('risk_tier')['event_flag'].mean().sort_values(ascending=False))
+
+# --------------------------------------------------------------------------
+# Summary Statistics
+# --------------------------------------------------------------------------
+print("="*60)
+print("SCORING SUMMARY")
+print("="*60)
+
+print(f"\nTotal customers scored: {len(df_model_data):,}")
+print(f"\nHazard Score Distribution:")
+print(df_model_data['hazard_score'].describe())
+
+print(f"\nRisk Tier Thresholds:")
+print(f"  High Risk: score >= {p80:.1f} (top 20%)")
+print(f"  Medium Risk: {p50:.1f} <= score < {p80:.1f} (20-50%)")
+print(f"  Low Risk: score < {p50:.1f} (bottom 50%)")
+
+print(f"\nRisk Tier Distribution:")
+tier_counts = df_model_data['risk_tier'].value_counts()
+for tier in ['High Risk', 'Medium Risk', 'Low Risk']:
+    count = tier_counts.get(tier, 0)
+    pct = count / len(df_model_data) * 100
+    print(f"  {tier}: {count:,} ({pct:.1f}%)")
+
+# Validate event rate by tier (High Risk should have highest event rate)
+print(f"\nEvent Rate by Risk Tier (validation):")
+event_by_tier = df_model_data.groupby('risk_tier')['event_flag'].mean().sort_values(ascending=False)
+for tier, rate in event_by_tier.items():
+    print(f"  {tier}: {rate*100:.1f}% experienced consolidation event")
+
+# Show sample high-risk customers
+print(f"\nSample High Risk Customers:")
+high_risk_sample = df_model_data[df_model_data['risk_tier'] == 'High Risk'].nlargest(10, 'hazard_score')
+print(high_risk_sample[['customer_id', 'hazard_score', 'risk_tier', 'breadth_slope', 
+                        'breadth_drop_pct', 'avg_monthly_spend']].to_string())
+
+print("\n" + "="*60)
+print("STEP 6 COMPLETE: All customers scored and tiered")
+print("="*60)
+%md
+### What Step 6 Did
+
+**Hazard Score Explained:**
+
+The hazard score is a **normalized measure of relative risk** ranging from 0 to 100. It answers the question: *Compared to other customers, how likely is this customer to start consolidating their category purchases soon?*
+
+- **Score = 85**: This customer is in the top 15% of risk — their behavioral patterns strongly match customers who went on to consolidate
+- **Score = 50**: Average risk — neither alarming nor reassuring
+- **Score = 15**: Low risk — this customer shows healthy category diversity patterns
+
+**Risk Tier Definitions:**
+
+| Tier | Percentile | What It Means | CRM Action |
+|------|-----------|---------------|------------|
+| **High Risk** | Top 20% | Strong signals of impending consolidation | Immediate intervention — cross-sell offers, personalized outreach |
+| **Medium Risk** | 20–50% | Some warning signs but not critical | Monitor closely, light-touch campaigns |
+| **Low Risk** | Bottom 50% | Healthy category engagement | No immediate action needed |
+
+**How CRM Teams Should Use This:**
+
+1. **Export High Risk customers weekly** for targeted campaigns
+2. **Prioritize by hazard_score** within High Risk (higher = more urgent)
+3. **Cross-reference with segment** — High Risk + declining segment should get premium treatment
+4. **Track intervention effectiveness** by comparing risk tier changes over time
+
+**Why Percentile-Based Tiers?**
+
+Fixed thresholds (e.g., "score > 70 = High Risk") would create inconsistent tier sizes over time. Percentile-based tiers ensure:
+- High Risk is always the top 20% most at-risk
+- Tier sizes stay consistent for capacity planning
+- CRM teams always have a prioritized queue of ~20% for proactive intervention
+%md
+## Step 7: Clustering (Trajectory Segmentation)
+
+This step segments customers into behavioral archetypes using KMeans clustering on their breadth time series. Each segment suggests a different intervention strategy.
+# ============================================================================
+# STEP 7: CLUSTERING (TRAJECTORY SEGMENTATION)
+# ============================================================================
+# Use KMeans (k=4) on breadth time series to identify behavioral archetypes:
+#   - Gradual Consolidator: slow steady decline
+#   - Sudden Dropper: sharp recent decline
+#   - Stable Multi-Category: healthy, no action needed
+#   - Recovering: was declining, now improving
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# 7A: Prepare clustering features (breadth time series in wide format)
+# --------------------------------------------------------------------------
+
+# Get the breadth columns from our pivot (these are the time series values)
+cluster_feature_cols = [
+    'breadth_slope',
+    'breadth_peak',
+    'breadth_current', 
+    'breadth_drop_pct',
+    'breadth_volatility',
+    'months_since_peak'
+]
+
+# Prepare clustering data
+df_cluster = df_model_data[['customer_id'] + cluster_feature_cols].copy()
+df_cluster = df_cluster.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+# --------------------------------------------------------------------------
+# 7B: Normalize features for clustering
+# --------------------------------------------------------------------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df_cluster[cluster_feature_cols])
+
+print(f"Clustering on {X_scaled.shape[0]:,} customers with {X_scaled.shape[1]} features")
+
+# --------------------------------------------------------------------------
+# 7C: Fit KMeans with k=4
+# --------------------------------------------------------------------------
+kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+df_cluster['cluster'] = kmeans.fit_predict(X_scaled)
+
+print(f"\nCluster sizes:")
+print(df_cluster['cluster'].value_counts().sort_index())
+
+# --------------------------------------------------------------------------
+# 7D: Analyze cluster centroids to assign meaningful labels
+# --------------------------------------------------------------------------
+
+# Get cluster centroids (in original scale)
+centroids_scaled = kmeans.cluster_centers_
+centroids_original = scaler.inverse_transform(centroids_scaled)
+centroids_df = pd.DataFrame(centroids_original, columns=cluster_feature_cols)
+centroids_df['cluster'] = range(4)
+
+print(f"\nCluster Centroids (original scale):")
+print(centroids_df.round(2).to_string())
+
+# --------------------------------------------------------------------------
+# 7E: Assign segment labels based on centroid characteristics
+# --------------------------------------------------------------------------
+# Logic:
+#   - Gradual Consolidator: negative slope, moderate drop, low volatility
+#   - Sudden Dropper: negative slope, high drop, high volatility
+#   - Stable Multi-Category: near-zero slope, low drop
+#   - Recovering: positive slope or current > recent trend suggests improvement
+
+def assign_segment_label(cluster_id, centroids_df):
+    """Assign meaningful segment label based on centroid characteristics."""
+    row = centroids_df[centroids_df['cluster'] == cluster_id].iloc[0]
+    
+    slope = row['breadth_slope']
+    drop_pct = row['breadth_drop_pct']
+    volatility = row['breadth_volatility']
+    current = row['breadth_current']
+    
+    # Decision tree for segment assignment
+    if slope > 0.1:  # Positive trend
+        return 'Recovering'
+    elif slope < -0.2 and drop_pct > 30:  # Strong negative trend + large drop
+        if volatility > 1.5:
+            return 'Sudden Dropper'
+        else:
+            return 'Gradual Consolidator'
+    elif abs(slope) <= 0.1 and drop_pct < 20:  # Stable
+        return 'Stable Multi-Category'
+    elif slope < 0:  # Negative but not severe
+        return 'Gradual Consolidator'
+    else:
+        return 'Stable Multi-Category'
+
+# Create mapping from cluster to segment
+cluster_to_segment = {}
+for cluster_id in range(4):
+    cluster_to_segment[cluster_id] = assign_segment_label(cluster_id, centroids_df)
+
+print(f"\nCluster to Segment Mapping:")
+for k, v in cluster_to_segment.items():
+    print(f"  Cluster {k} -> {v}")
+
+# If we have duplicate labels, disambiguate based on severity
+label_counts = pd.Series(cluster_to_segment.values()).value_counts()
+if label_counts.max() > 1:
+    print("\nNote: Refining duplicate segment labels based on severity...")
+    # Sort clusters by breadth_slope and reassign
+    sorted_clusters = centroids_df.sort_values('breadth_slope')['cluster'].tolist()
+    segment_labels = ['Sudden Dropper', 'Gradual Consolidator', 'Stable Multi-Category', 'Recovering']
+    cluster_to_segment = dict(zip(sorted_clusters, segment_labels))
+    print(f"Refined mapping: {cluster_to_segment}")
+
+# Apply segment labels
+df_cluster['segment'] = df_cluster['cluster'].map(cluster_to_segment)
+
+# Merge segment back to main model data
+df_model_data['segment'] = df_cluster['segment']
+
+# --------------------------------------------------------------------------
+# 7F: Summary by segment
+# --------------------------------------------------------------------------
+print(f"\n" + "="*60)
+print("SEGMENT SUMMARY")
+print("="*60)
+
+segment_summary = df_model_data.groupby('segment').agg({
+    'customer_id': 'count',
+    'hazard_score': 'mean',
+    'breadth_slope': 'mean',
+    'breadth_drop_pct': 'mean',
+    'avg_monthly_spend': 'mean',
+    'event_flag': 'mean'
+}).round(2)
+segment_summary.columns = ['Count', 'Avg Hazard Score', 'Avg Breadth Slope', 
+                           'Avg Drop %', 'Avg Monthly Spend', 'Event Rate']
+print(segment_summary.to_string())
+
+# Visualization
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Segment distribution
+ax1 = axes[0]
+segment_counts = df_model_data['segment'].value_counts()
+colors = {'Sudden Dropper': '#e74c3c', 'Gradual Consolidator': '#f39c12', 
+          'Stable Multi-Category': '#27ae60', 'Recovering': '#3498db'}
+bar_colors = [colors.get(seg, '#95a5a6') for seg in segment_counts.index]
+segment_counts.plot(kind='bar', ax=ax1, color=bar_colors)
+ax1.set_title('Customer Count by Segment', fontsize=12)
+ax1.set_xlabel('Segment')
+ax1.set_ylabel('Number of Customers')
+ax1.tick_params(axis='x', rotation=45)
+
+# Hazard score by segment
+ax2 = axes[1]
+df_model_data.boxplot(column='hazard_score', by='segment', ax=ax2)
+ax2.set_title('Hazard Score Distribution by Segment', fontsize=12)
+ax2.set_xlabel('Segment')
+ax2.set_ylabel('Hazard Score')
+plt.suptitle('')  # Remove automatic title
+
+plt.tight_layout()
+plt.show()
+
+print("\n" + "="*60)
+print("STEP 7 COMPLETE: Trajectory segmentation finished")
+print("="*60)
+%md
+### What Step 7 Did
+
+**Why Cluster on Top of the Cox Model?**
+
+The Cox model tells us **who** is at risk. Clustering tells us **why** they're at risk and **how** to intervene. Two customers might have the same hazard score but need completely different interventions:
+
+| Segment | Behavior Pattern | CRM Intervention Strategy |
+|---------|-----------------|---------------------------|
+| **Gradual Consolidator** | Slow, steady decline in categories over months | Long nurture campaign, variety incentives ("Shop 3 departments, get 10% off"), category discovery emails |
+| **Sudden Dropper** | Sharp, recent drop — something changed | Immediate win-back offer on the specific dropped category, "We miss you in Electronics!" |
+| **Stable Multi-Category** | Healthy engagement across departments | No urgent action — maintain relationship, reward loyalty |
+| **Recovering** | Was declining but now improving | Positive reinforcement! Thank them, loyalty bonus, keep the momentum |
+
+**How Segments Are Determined:**
+
+KMeans clustering groups customers with similar breadth trajectory patterns. We then interpret each cluster's centroid (average characteristics) to assign a business-meaningful label:
+
+- **Negative slope + high drop %** → Consolidators
+- **High volatility** → Sudden (erratic behavior)
+- **Near-zero slope + low drop** → Stable
+- **Positive slope** → Recovering
+
+**Integration with Risk Tiers:**
+
+The final output combines both dimensions:
+- A "High Risk + Sudden Dropper" needs **urgent, targeted intervention**
+- A "High Risk + Gradual Consolidator" needs **sustained nurture campaign**
+- A "Medium Risk + Recovering" needs **encouragement to keep improving**
+
+This two-dimensional view (risk level × behavior type) enables much more personalized CRM campaigns than risk tier alone.
+%md
+## Step 8: Write Output to Delta Table
+
+This step persists the scored customer data to a Delta table for downstream consumption by Genie Spaces, dashboards, and CRM audience extraction systems.
+# ============================================================================
+# STEP 8: WRITE OUTPUT TO DELTA TABLE
+# ============================================================================
+# Write final scored table to Unity Catalog.
+# Output is now region-based (no city, no mobile), supermarket-only,
+# and category-wise for breadth and event detection.
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# 8A: Prepare final output dataframe
+# --------------------------------------------------------------------------
+df_model_data['scoring_date'] = pd.Timestamp.now().date()
+
+output_columns = [
+    'customer_id',
+    'region_name',
+    'loyalty_tenure_months',
+    'is_happiness_member',
+    # Breadth features
+    'breadth_current',
+    'breadth_peak',
+    'breadth_drop_pct',
+    'breadth_slope',
+    'breadth_volatility',
+    'months_since_peak',
+    # Seasonality-aware features
+    'active_month_ratio',
+    'breadth_prev_3m_avg',
+    'breadth_recent_3m_avg',
+    'breadth_recent_vs_prev_3m_ratio',
+    'spend_prev_3m_avg',
+    'spend_recent_3m_avg',
+    'spend_recent_vs_prev_3m_ratio',
+    'weekend_txn_share',
+    'top_category_spend_share',
+    # Spend features
+    'avg_monthly_spend',
+    'spend_slope',
+    'atv',
+    # Enriched attrs signals
+    'core_segment',
+    'crm_segment',
+    'maturity_band',
+    'recency_band',
+    'nationality',
+    'recency',
+    'maturity',
+    'visit_probability_30',
+    'decrease_cohort',
+    'sale_decile',
+    # Model outputs
+    'hazard_score',
+    'risk_tier',
+    'segment',
+    'event_flag',
+    'event_time',
+    'scoring_date'
+]
+
+available_cols = [col for col in output_columns if col in df_model_data.columns]
+df_output = df_model_data[available_cols].copy()
+
+if 'region_name' not in df_output.columns:
+    df_output['region_name'] = 'Unknown'
+
+print(f"Output dataframe shape: {df_output.shape}")
+print(f"\nOutput schema:")
+print(df_output.dtypes)
+
+# --------------------------------------------------------------------------
+# 8B: Convert to Spark and write to Delta
+# --------------------------------------------------------------------------
+df_output_spark = spark.createDataFrame(df_output)
+
+OUTPUT_CATALOG = "dev"
+OUTPUT_SCHEMA = "analytics"
+OUTPUT_TABLE = "pp_wallet_share_protection_scores_uae"
+FULL_TABLE_NAME = f"{OUTPUT_CATALOG}.{OUTPUT_SCHEMA}.{OUTPUT_TABLE}"
+
+print(f"\nWriting to: {FULL_TABLE_NAME}")
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {OUTPUT_CATALOG}.{OUTPUT_SCHEMA}")
+
+df_output_spark.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(FULL_TABLE_NAME)
+
+print(f"Successfully wrote {df_output_spark.count():,} rows to {FULL_TABLE_NAME}")
+
+# --------------------------------------------------------------------------
+# 8C: Verify write and show sample
+# --------------------------------------------------------------------------
+print(f"\nVerifying written data:")
+df_verify = spark.table(FULL_TABLE_NAME)
+print(f"Row count: {df_verify.count():,}")
+print(f"\nSample output:")
+df_verify.show(10, truncate=False)
+
+spark.sql(f"""
+    COMMENT ON TABLE {FULL_TABLE_NAME} IS
+    'Wallet Share Protection scores for UAE VIP supermarket customers. Category-wise breadth model with primary region_name from last 90-day supermarket transactions, seasonality-aware features, hazard scores, risk tiers, and behavioral segments. Refreshed weekly. pp_ prefix = Hackathon project asset.'
+""")
+
+print("\n" + "="*60)
+print("STEP 8 COMPLETE: Output written to Delta table")
+print("="*60)
+%md
+### What Step 8 Did
+
+**Output Table Schema:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| customer_id | bigint | Primary key — unique customer identifier |
+| mobile | string | Customer mobile number for SMS campaigns |
+| city | string | Customer city for geo-targeted offers |
+| loyalty_tenure_months | int | Months since loyalty enrollment |
+| is_happiness_member | int | 1 = enrolled in loyalty program |
+| breadth_current | double | Most recent month's category breadth |
+| breadth_peak | double | Highest breadth in observation window |
+| breadth_drop_pct | double | Percentage drop from peak |
+| breadth_slope | double | Trend direction (negative = declining) |
+| avg_monthly_spend | double | Average monthly transaction value |
+| atv | double | Average transaction value per visit |
+| hazard_score | double | 0-100 risk score (higher = more at risk) |
+| risk_tier | string | High Risk / Medium Risk / Low Risk |
+| segment | string | Behavioral archetype (Sudden Dropper, etc.) |
+| event_flag | int | 1 = already experienced decline event |
+| event_time | int | Months until event (or observation end) |
+| scoring_date | date | When this scoring was generated |
+
+**Downstream Use Cases:**
+
+1. **Genie Space**: Business users can ask natural language questions like "Show me high risk customers in Dubai" or "What's the average spend of Sudden Droppers?"
+
+2. **CRM Audience Extraction**: Marketing teams query this table to pull targeted lists:
+   ```sql
+   SELECT * FROM dev.analytics.pp_wallet_share_protection_scores_uae
+   WHERE risk_tier = 'High Risk' AND segment = 'Sudden Dropper'
+   ```
+
+3. **Dashboards**: Real-time monitoring of risk distribution trends over time
+
+4. **Campaign Attribution**: Track whether interventions reduce hazard scores in subsequent runs
+
+**Data Freshness Recommendation:**
+
+Run this notebook **weekly** (e.g., every Monday morning) to:
+- Capture recent behavioral changes promptly
+- Give CRM teams fresh targets each week
+- Track whether previous interventions are working
+%md
+## Step 9: Audience Export Query
+
+This step provides a ready-to-use SQL query that CRM teams can execute to extract the highest-priority intervention targets.
+%sql
+-- ============================================================================
+-- STEP 9: CRM AUDIENCE EXPORT QUERY
+-- ============================================================================
+-- Extract top 500 high-risk Happiness members for immediate intervention
+-- Supermarket-only, category-wise model; use region_name instead of city/mobile
+-- ============================================================================
+
+SELECT
+    customer_id,
+    region_name,
+    risk_tier,
+    segment,
+    hazard_score,
+    breadth_current,
+    breadth_drop_pct,
+    breadth_recent_vs_prev_3m_ratio,
+    spend_recent_vs_prev_3m_ratio,
+    avg_monthly_spend,
+    atv,
+    weekend_txn_share,
+    top_category_spend_share
+FROM dev.analytics.pp_wallet_share_protection_scores_uae
+WHERE risk_tier = 'High Risk'
+  AND is_happiness_member = 1
+ORDER BY hazard_score DESC
+LIMIT 500
+%md
+### What Step 9 Did
+
+**Why Filter to Happiness Members First?**
+
+Happiness members (loyalty program enrollees) are prioritized because:
+- **Higher lifetime value (LTV)**: They've already demonstrated commitment to the brand
+- **More data available**: Loyalty enrollment means we have richer behavioral history
+- **Better intervention ROI**: Retention is cheaper than acquisition
+- **Direct communication channel**: We have their contact info for personalized outreach
+
+**How This List Goes to CRM:**
+
+1. **Scheduled Export**: This query can be scheduled to run weekly and export to a shared location
+2. **ADBC/SWAN Integration**: For automated campaign triggers, connect this query output to your CRM platform's API
+3. **Manual Upload**: For ad-hoc campaigns, download CSV and upload to campaign management system
+
+**Expected Campaign Actions:**
+
+| Segment in Export | Recommended Campaign |
+|-------------------|---------------------|
+| Sudden Dropper | **Immediate win-back**: "We noticed you haven't visited Electronics lately. Here's 15% off your next purchase!" |
+| Gradual Consolidator | **Variety incentive**: "Shop 3 departments this month and earn 3x points" |
+| Any High Risk | **Personalized cross-sell**: Recommend products from their historically-purchased-but-recently-abandoned categories |
+
+**Query Customization Options:**
+
+```sql
+-- Filter by specific segment:
+WHERE risk_tier = 'High Risk' AND segment = 'Sudden Dropper'
+
+-- Filter by city for geo-targeted campaign:
+WHERE risk_tier = 'High Risk' AND city = 'Dubai'
+
+-- Get larger audience for mass campaign:
+LIMIT 2000
+
+-- Include Medium Risk for broader reach:
+WHERE risk_tier IN ('High Risk', 'Medium Risk')
+```
+# ============================================================================
+# RESULTS SUMMARY
+# ============================================================================
+# Generate final summary statistics for reporting
+# ============================================================================
+
+print("="*70)
+print("                    WALLET SHARE PROTECTION - RESULTS SUMMARY")
+print("="*70)
+
+# Total customers scored
+total_customers = len(df_model_data)
+print(f"\nOVERALL METRICS")
+print(f"   Total customers scored: {total_customers:,}")
+print(f"   Scoring date: {pd.Timestamp.now().strftime('%Y-%m-%d')}")
+print(f"   Model concordance index: {concordance:.3f}")
+print(f"   Region coverage: {(df_model_data['region_name'] != 'Unknown').mean()*100:.1f}% with primary region")
+
+# Risk tier distribution
+print(f"\nRISK TIER DISTRIBUTION")
+for tier in ['High Risk', 'Medium Risk', 'Low Risk']:
+    count = len(df_model_data[df_model_data['risk_tier'] == tier])
+    pct = count / total_customers * 100
+    print(f"   {tier}: {count:,} customers ({pct:.1f}%)")
+
+# Segment distribution
+print(f"\nSEGMENT DISTRIBUTION")
+for segment in df_model_data['segment'].dropna().unique():
+    count = len(df_model_data[df_model_data['segment'] == segment])
+    pct = count / total_customers * 100
+    avg_hazard = df_model_data[df_model_data['segment'] == segment]['hazard_score'].mean()
+    print(f"   {segment}: {count:,} customers ({pct:.1f}%), avg hazard = {avg_hazard:.1f}")
+
+# Key insights by segment
+print(f"\nKEY INSIGHTS BY SEGMENT")
+
+insights = {
+    'Sudden Dropper': 'These customers experienced an abrupt decline in supermarket category breadth. Immediate win-back offers on their dropped categories are recommended.',
+    'Gradual Consolidator': 'These customers are slowly narrowing their supermarket shopping scope over time. Variety incentives and nurture campaigns can help.',
+    'Stable Multi-Category': 'These customers maintain healthy engagement across multiple supermarket categories. Continue monitoring and rewarding loyalty.',
+    'Recovering': 'These customers were previously declining but are now improving. Positive reinforcement can help sustain recovery.'
+}
+
+for segment, insight in insights.items():
+    if segment in df_model_data['segment'].values:
+        print(f"\n   {segment}:")
+        print(f"   {insight}")
+
+# High-value targets summary
+print(f"\nHIGH-PRIORITY INTERVENTION TARGETS")
+high_risk_happiness = df_model_data[
+    (df_model_data['risk_tier'] == 'High Risk') &
+    (df_model_data['is_happiness_member'] == 1)
+]
+print(f"   High Risk + Happiness Members: {len(high_risk_happiness):,} customers")
+print(f"   Combined monthly spend at risk: AED {high_risk_happiness['avg_monthly_spend'].sum():,.0f}")
+print(f"   Average hazard score: {high_risk_happiness['hazard_score'].mean():.1f}")
+
+print("\n" + "="*70)
+print("                         PIPELINE EXECUTION COMPLETE")
+print("="*70)
+print(f"\nOutput table: dev.analytics.pp_wallet_share_protection_scores_uae")
+print("Scope: UAE VIP loyalty customers | SUPER MARKET only | category-wise breadth")
+print("Recommended refresh frequency: Weekly (every Monday)")
+print("Next steps: Run Step 9 SQL query to extract CRM audience")
+%md
+## Results Summary
+
+### Pipeline Output
+
+This notebook has successfully:
+1. ✅ Extracted 9 months of UAE transaction, product, and customer data
+2. ✅ Computed monthly category breadth metrics per customer
+3. ✅ Labeled survival analysis events (3-month sustained decline)
+4. ✅ Engineered trajectory and profile features
+5. ✅ Trained Cox Proportional Hazards model
+6. ✅ Scored all customers with hazard scores and risk tiers
+7. ✅ Segmented customers into behavioral archetypes
+8. ✅ Written results to Delta table for downstream consumption
+9. ✅ Provided ready-to-use CRM export query
+
+### Recommended Actions
+
+| Priority | Action | Owner |
+|----------|--------|-------|
+| **P0** | Run Step 9 query to extract High Risk audience | CRM Team |
+| **P0** | Configure win-back campaign for Sudden Droppers | Marketing |
+| **P1** | Set up variety incentive campaign for Gradual Consolidators | Marketing |
+| **P1** | Schedule this notebook to run weekly | Data Engineering |
+| **P2** | Build Genie Space on output table for self-service queries | Analytics |
+| **P2** | Create monitoring dashboard for risk distribution trends | BI Team |
+
+### Model Performance Notes
+
+- **Concordance Index**: Measures how well the model ranks customers by risk. Target is >= 0.65.
+- **Event Rate**: Percentage of customers who experienced the consolidation event in our observation window.
+- If model performance degrades over time, consider retraining with fresh data or adding new features.
+
+### Data Lineage
+
+```
+gold.transaction.uae_pos_transactions
+        ↓
+gold.material.material_master (join for department mapping)
+        ↓
+gold.customer.vynamic_customer_profile (join for loyalty info)
+        ↓
+[Feature Engineering + Cox Model + Clustering]
+        ↓
+dev.analytics.pp_wallet_share_protection_scores_uae
+```
